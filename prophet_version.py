@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from prophet import Prophet 
+from prophet import Prophet  
 
 def load_series(csv_path, time_col='date', value_col='sales', name='y', freq='D'):
     df = pd.read_csv(csv_path, usecols=[time_col, value_col], index_col=0, parse_dates=[time_col])
