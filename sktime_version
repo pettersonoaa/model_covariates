@@ -14,6 +14,117 @@ from sktime.forecasting.base import ForecastingHorizon
 from sktime.forecasting.compose import TransformedTargetForecaster
 
 
+
+
+
+def direct_prophet_analysis(y_train, y_test, X_train=None, X_test=None, best_params=None, country='BR'):
+    """
+    Create and fit a Prophet model directly using the best parameters from grid search
+    and visualize the results.
+    
+    Parameters:
+    -----------
+    y_train : pd.Series
+        Training target data with datetime index
+    y_test : pd.Series
+        Test target data with datetime index
+    X_train : pd.Series, optional
+        Training exogenous variable (e.g., transactions)
+    X_test : pd.Series, optional
+        Test exogenous variable (e.g., transactions)
+    best_params : dict, optional
+        Dictionary of best parameters from grid search
+    country : str, default='BR'
+        Country code for holidays
+        
+    Returns:
+    --------
+    dict
+        Dictionary containing the Prophet model, forecast, and performance metrics
+    """
+    from prophet import Prophet as ProphetDirect
+    import logging
+    logging.getLogger('prophet').setLevel(logging.ERROR)
+    
+    # Extract parameters or use defaults if not provided
+    if best_params is None:
+        best_params = {}
+    
+    seasonality_mode = best_params.get('forecaster__seasonality_mode', 'additive')
+    ln_transform = best_params.get('ln__passthrough', True)
+    
+    # Prepare data in Prophet's required format
+    df = pd.DataFrame({'ds': y_train.index, 'y': y_train.values})
+    
+    # Apply log transform if needed
+    if ln_transform:
+        df['y'] = np.log1p(df['y'])
+    
+    # Create holidays dataframe
+    holidays_df = holidays_features(y_train, country=country)
+    
+    # Create and fit Prophet model directly
+    model_prophet = ProphetDirect(
+        seasonality_mode=seasonality_mode,
+        holidays=holidays_df,
+        daily_seasonality=False,
+        weekly_seasonality=True,
+        yearly_seasonality=True
+    )
+    
+    # Add regressor if X data is available
+    if X_train is not None:
+        model_prophet.add_regressor('transactions')
+        df['transactions'] = X_train.values
+    
+    # Fit the model
+    model_prophet.fit(df)
+    
+    # Create future dataframe for prediction
+    future = pd.DataFrame({'ds': y_test.index})
+    if X_test is not None:
+        future['transactions'] = X_test.values
+    
+    # Make predictions
+    forecast = model_prophet.predict(future)
+    
+    # Transform back if log transform was applied
+    if ln_transform:
+        y_pred_prophet = pd.Series(np.expm1(forecast['yhat']), index=y_test.index)
+    else:
+        y_pred_prophet = pd.Series(forecast['yhat'], index=y_test.index)
+    
+    # Calculate error metrics
+    prophet_mape = mape_metric(y_test, y_pred_prophet)
+    print(f"Direct Prophet MAPE: {prophet_mape:.2f}%")
+    
+    # Create visualizations
+    # Prophet's built-in plots
+    plt.figure(figsize=(15, 8))
+    model_prophet.plot(forecast, figsize=(15, 8))
+    plt.title(f'Prophet Direct Forecast (MAPE: {prophet_mape:.2f}%)')
+    plt.tight_layout()
+    plt.show()
+    
+    # Plot the components
+    fig_comp = model_prophet.plot_components(forecast)
+    plt.tight_layout()
+    plt.show()
+    
+    return {
+        'model': model_prophet,
+        'forecast': forecast,
+        'predictions': y_pred_prophet,
+        'mape': prophet_mape
+    }
+
+
+
+
+
+
+
+
 def mape_metric(y_true, y_pred, month_transform=True):
     if month_transform:
         y_true = y_true.groupby(y_true.index.month).sum()
@@ -46,6 +157,9 @@ y_train, y_test, X_train, X_test = temporal_train_test_split(y, X, test_size=7*(
 # forecaster = Prophet(holidays=holidays_features(y_train))
 # forecaster.fit(y_train, X=X_train)
 
+
+
+
 model = {
     "name": "Prophet",
     "forecaster": Prophet(
@@ -53,10 +167,10 @@ model = {
         ),
     "params": {
         "forecaster__uncertainty_samples": [50],
-        "forecaster__changepoint_range": [0.4, 0.6, 0.8],  # =0.8 Proportion of history in which trend changepoints will be estimated
-        "forecaster__changepoint_prior_scale": [0.03, 0.05, 0.08],  # =0.05 Flexibility of trend - Large values will allow many changepoints, small values will allow few changepoints
+        # "forecaster__changepoint_range": [0.4, 0.6, 0.8],  # =0.8 Proportion of history in which trend changepoints will be estimated
+        # "forecaster__changepoint_prior_scale": [0.03, 0.05, 0.08],  # =0.05 Flexibility of trend - Large values will allow many changepoints, small values will allow few changepoints
         "forecaster__seasonality_mode": ['multiplicative', 'additive'], # ='additive'
-        "forecaster__seasonality_prior_scale": [6, 10, 12],   # =10 Flexibility of seasonality 
+        # "forecaster__seasonality_prior_scale": [6, 10, 12],   # =10 Flexibility of seasonality 
 
         "ln__passthrough": [True],
     },
@@ -99,6 +213,8 @@ try:
         fh=ForecastingHorizon(y_test.index, is_relative=False)
     )
 
+    
+
     best_forecaster = gscv.best_forecaster_
     best_params = gscv.best_params_
     best_score = mape_metric(y_test, y_pred)
@@ -112,6 +228,78 @@ try:
     print(f'n Best scores: {n_best_score}')
     # [print(f"{rank_model[0]}# best forecaster: {rank_model[1]}") for rank_model in n_best_forecasters]
 
+    
+
+
+
+
+    # Create figure with multiple subplots for analysis
+    plt.style.use('seaborn-v0_8')  # Using valid style name
+    colors = ['#8B949E', '#CF222E', '#003f5c', '#8250DF']
+
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(17, 10))
+    
+    # Plot 1: Actual vs Predicted
+    ax1.plot(y_test.index, y_test.values, label='Actual', color=colors[0], linewidth=1.0)
+    ax1.plot(y_pred.index, y_pred.values, label='Predicted', color=colors[1], linewidth=3.0)
+    ax1.set_title(f'Forecast Results (MAPE: {best_score:.2f}%)')
+    ax1.set_xlabel('Date')
+    ax1.set_ylabel('Sales')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    # Plot 2: Residuals over time
+    residuals = y_test - y_pred
+    ax2.axhline(y=0, color='black', linestyle='--', alpha=0.3)
+    ax2.plot(y_test.index, residuals, color=colors[2], linewidth=3.0)
+    ax2.set_title('Forecast Residuals')
+    ax2.set_xlabel('Date')
+    ax2.set_ylabel('Residual')
+    ax2.grid(True, axis='y', alpha=0.3)
+    
+    # Plot 3: Residuals distribution
+    sns.histplot(residuals, kde=True, ax=ax3, color=colors[2], alpha=0.6)
+    ax3.set_title('Residuals Distribution')
+    ax3.set_xlabel('Residual Value')
+    ax3.grid(True, alpha=0.3)
+    
+    # Plot 4: Actual vs Predicted scatter
+    ax4.scatter(y_test, y_pred, alpha=0.5, color=colors[0])
+    ax4.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], 
+             color=colors[1], linestyle='--')
+    ax4.set_title('Actual vs Predicted')
+    ax4.set_xlabel('Actual Values')
+    ax4.set_ylabel('Predicted Values')
+    ax4.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.show()
+
+
+
+    # Call the direct prophet analysis function
+    prophet_results = direct_prophet_analysis(
+        y_train=y_train,
+        y_test=y_test,
+        X_train=X_train,
+        X_test=X_test,
+        best_params=best_params
+    )
+
+
+
+
 except Exception as e:
     print(f"Error with {model['name']}: {str(e)}") #
 
+# # Plot results
+# plt.figure(figsize=(15, 7))
+# plt.plot(y_test.index, y_test.values, label='Actual', color='grey')
+# plt.plot(y_pred.index, y_pred.values, label='Predicted', color='red', linestyle='--')
+# plt.title(f'Prophet Model Forecasting Results\nMAPE: {best_score:.2f}%')
+# plt.xlabel('Date')
+# plt.ylabel('Sales')
+# plt.legend()
+# plt.grid(True)
+# plt.tight_layout()
+# plt.show()
