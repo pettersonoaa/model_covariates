@@ -7,6 +7,111 @@ import seaborn as sns
 from holidays import country_holidays
 from sktime.forecasting.fbprophet import Prophet
 from sktime.transformations.series.boxcox import LogTransformer
+from sktime.split import SlidingWindowSplitter
+from sktime.transformations.compose import OptionalPassthrough
 from sktime.forecasting.model_selection import temporal_train_test_split, ForecastingGridSearchCV
 from sktime.forecasting.base import ForecastingHorizon
 from sktime.forecasting.compose import TransformedTargetForecaster
+
+
+def mape_metric(y_true, y_pred, month_transform=True):
+    if month_transform:
+        y_true = y_true.groupby(y_true.index.month).sum()
+        y_pred = y_pred.groupby(y_pred.index.month).sum()
+    return np.mean(np.abs((y_true - y_pred) / y_true) * 100)
+
+
+def holidays_features(data, country='BR', horizon_years=5):
+    ch = country_holidays(country, years=list(range(data.index.year.min(), data.index.year.max()+horizon_years)))
+    series = pd.Series(ch)
+    df = pd.DataFrame({'ds': series.index, 'holiday': series.values})
+    df['lower_window'] = -5
+    df['upper_window'] = 5
+    df['ds'] = pd.to_datetime(df['ds'])
+    return df
+
+def load_series(csv_path, time_col='date', value_col='sales', name='y', freq='D'):
+    df = pd.read_csv(csv_path, usecols=[time_col, value_col], index_col=0, parse_dates=[time_col])
+    df = df.groupby(time_col)[value_col].sum().asfreq(freq)
+    series = pd.Series(df, index=df.index, name=name)
+    series = series.interpolate(method='time')
+    return series
+
+y = load_series(csv_path='data/groupby_train.csv', value_col='sales', name='y')
+X = load_series(csv_path='data/groupby_transactions.csv', value_col='transactions', name='transactions')
+y_train, y_test, X_train, X_test = temporal_train_test_split(y, X, test_size=7*(4+1))
+
+# print(X, y)
+
+# forecaster = Prophet(holidays=holidays_features(y_train))
+# forecaster.fit(y_train, X=X_train)
+
+model = {
+    "name": "Prophet",
+    "forecaster": Prophet(
+        holidays=holidays_features(y_train)
+        ),
+    "params": {
+        "forecaster__uncertainty_samples": [50],
+        "forecaster__changepoint_range": [0.4, 0.6, 0.8],  # =0.8 Proportion of history in which trend changepoints will be estimated
+        "forecaster__changepoint_prior_scale": [0.03, 0.05, 0.08],  # =0.05 Flexibility of trend - Large values will allow many changepoints, small values will allow few changepoints
+        "forecaster__seasonality_mode": ['multiplicative', 'additive'], # ='additive'
+        "forecaster__seasonality_prior_scale": [6, 10, 12],   # =10 Flexibility of seasonality 
+
+        "ln__passthrough": [True],
+    },
+    "family": 'stats',
+}
+
+cv = SlidingWindowSplitter(
+    initial_window=28*12*4,    # 4 years training
+    window_length=28*12*3,     # 3 years validation
+    step_length=int(len(y_test))*4,        # 2 month step
+    fh=list(range(1, int(len(y_test))))
+)
+# from sktime.utils.plotting import plot_series, plot_windows
+# plot_windows(cv, y_train, title="Sliding Window Cross-validation")
+# plt.show()
+
+pipe = TransformedTargetForecaster(
+    [
+        ("ln", OptionalPassthrough(LogTransformer())),
+        ("forecaster", model["forecaster"]),
+    ]
+)
+
+gscv = ForecastingGridSearchCV(
+    forecaster=pipe,
+    param_grid=[model["params"]],
+    cv=cv,
+    return_n_best_forecasters=1,
+    backend="loky",  
+    backend_params={"n_jobs": -1}, 
+)
+
+try:
+    gscv.fit(
+        y=y_train, 
+        X=X_train
+    )
+    y_pred = gscv.predict(
+        X=X_test, 
+        fh=ForecastingHorizon(y_test.index, is_relative=False)
+    )
+
+    best_forecaster = gscv.best_forecaster_
+    best_params = gscv.best_params_
+    best_score = mape_metric(y_test, y_pred)
+    n_best_score = gscv.n_best_scores_
+    n_best_forecasters = gscv.n_best_forecasters_
+
+    # Add debug print
+    print(f"Model: {model['name']}")
+    print(f"Best parameters: {best_params}")
+    print(f"Best score: {best_score:.2f}%")
+    print(f'n Best scores: {n_best_score}')
+    # [print(f"{rank_model[0]}# best forecaster: {rank_model[1]}") for rank_model in n_best_forecasters]
+
+except Exception as e:
+    print(f"Error with {model['name']}: {str(e)}") #
+

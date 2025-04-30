@@ -17,7 +17,6 @@ df_y = load_series(csv_path='data/groupby_train.csv', value_col='sales', name='y
 df_X = load_series(csv_path='data/groupby_transactions.csv', value_col='transactions', name='transactions')
 df = pd.concat([df_y, df_X], axis=1)
 df = df.reset_index()
-print(df)
 df['transactions_lag30'] = df['transactions'].shift(30)
 df['transactions_lag60'] = df['transactions'].shift(60)
 df['transactions_lag90'] = df['transactions'].shift(90)
