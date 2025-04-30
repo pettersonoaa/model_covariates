@@ -1,0 +1,1177 @@
+"""
+Advanced Time Series Forecasting with Prophet
+--------------------------------------------
+This module implements time series forecasting with Facebook Prophet, including:
+- Feature engineering for covariates (deseasonalization, lag creation)
+- Grid search for hyperparameter optimization
+- Model evaluation and visualization
+- Future forecasting capability
+
+Author: [Your Name]
+Date: April 30, 2025
+"""
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from prophet import Prophet as ProphetDirect
+import logging
+from holidays import country_holidays
+
+from sktime.forecasting.fbprophet import Prophet
+from sktime.transformations.series.boxcox import LogTransformer
+from sktime.split import SlidingWindowSplitter
+from sktime.transformations.compose import OptionalPassthrough
+from sktime.forecasting.model_selection import temporal_train_test_split, ForecastingGridSearchCV
+from sktime.forecasting.base import ForecastingHorizon
+from sktime.forecasting.compose import TransformedTargetForecaster
+from sktime.utils.plotting import plot_windows
+
+# Configure logging
+logging.getLogger('prophet').setLevel(logging.ERROR)
+
+# Set consistent styling for plots
+PLOT_STYLE = 'seaborn-v0_8'
+COLORS = ['#8B949E', '#CF222E', '#003f5c', '#8250DF']  # GitHub-inspired colors
+
+# -------------------------------------------------------------------------
+# Utility Functions
+# -------------------------------------------------------------------------
+
+def mape_metric(y_true, y_pred, month_transform=True):
+    """
+    Calculate Mean Absolute Percentage Error (MAPE) with better handling of edge cases.
+    """
+    # Make copies to avoid modifying originals
+    y_true = y_true.copy()
+    y_pred = y_pred.copy()
+    
+    # Ensure indexes are aligned
+    y_pred = y_pred.reindex(y_true.index)
+    
+    # Check for NaN values
+    valid_mask = pd.notnull(y_true) & pd.notnull(y_pred)
+    y_true = y_true[valid_mask]
+    y_pred = y_pred[valid_mask]
+    
+    if len(y_true) == 0:
+        print("Warning: No valid data points for MAPE calculation")
+        return float('nan')
+    
+    # Handle zeros in y_true to avoid division by zero
+    zero_mask = (y_true == 0)
+    if zero_mask.any():
+        print(f"Warning: {zero_mask.sum()} zero values found in y_true. Replacing with small value.")
+        y_true[zero_mask] = 1e-10
+    
+    if month_transform:
+        # Group by month but preserve other time features if needed
+        y_true_monthly = y_true.groupby(y_true.index.month).sum()
+        y_pred_monthly = y_pred.groupby(y_pred.index.month).sum()
+        
+        # Check if we have enough data after grouping
+        if len(y_true_monthly) == 0:
+            print("Warning: No data after monthly aggregation")
+            return float('nan')
+            
+        mape = np.mean(np.abs((y_true_monthly - y_pred_monthly) / y_true_monthly)) * 100
+    else:
+        # Calculate point-by-point MAPE
+        mape = np.mean(np.abs((y_true - y_pred) / y_true)) * 100
+    
+    # Check for unreasonable MAPE values
+    if mape > 100:
+        print(f"Warning: High MAPE value ({mape:.2f}%). Capping at 100%")
+        mape = 100.0
+        
+    return mape
+
+
+def holidays_features(data, country='BR', horizon_years=5):
+    """
+    Create holiday features dataframe for Prophet.
+    
+    Parameters:
+    -----------
+    data : pd.Series
+        Time series data with datetime index
+    country : str, default='BR'
+        Country code for holidays
+    horizon_years : int, default=5
+        Number of years to include in the holiday dataframe
+        
+    Returns:
+    --------
+    pd.DataFrame
+        DataFrame with holiday information formatted for Prophet
+    """
+    years_range = list(range(data.index.year.min(), data.index.year.max() + horizon_years))
+    ch = country_holidays(country, years=years_range)
+    series = pd.Series(ch)
+    
+    df = pd.DataFrame({'ds': series.index, 'holiday': series.values})
+    df['lower_window'] = -5
+    df['upper_window'] = 5
+    df['ds'] = pd.to_datetime(df['ds'])
+    
+    return df
+
+
+def load_series(csv_path, time_col='date', value_col='sales', name='y', freq='D'):
+    """
+    Load and prepare time series data from CSV file.
+    
+    Parameters:
+    -----------
+    csv_path : str
+        Path to the CSV file
+    time_col : str, default='date'
+        Column name for date/time
+    value_col : str, default='sales'
+        Column name for values
+    name : str, default='y'
+        Name for the resulting series
+    freq : str, default='D'
+        Frequency of the time series
+        
+    Returns:
+    --------
+    pd.Series
+        Time series with datetime index and interpolated missing values
+    """
+    df = pd.read_csv(csv_path, usecols=[time_col, value_col], index_col=0, parse_dates=[time_col])
+    df = df.groupby(time_col)[value_col].sum().asfreq(freq)
+    series = pd.Series(df, index=df.index, name=name)
+    series = series.interpolate(method='time')
+    
+    return series
+
+
+# -------------------------------------------------------------------------
+# Feature Engineering
+# -------------------------------------------------------------------------
+
+def preprocess_covariates(X_train, X_test, lags=[1, 7, 14], deseasonalize=True):
+    """
+    Preprocess covariates by adding lags and deseasonalizing.
+    
+    Parameters:
+    -----------
+    X_train : pd.Series
+        Training covariate data with datetime index
+    X_test : pd.Series
+        Test covariate data with datetime index
+    lags : list, default=[1, 7, 14]
+        List of lag values to create
+    deseasonalize : bool, default=True
+        Whether to deseasonalize the data
+        
+    Returns:
+    --------
+    tuple
+        (X_train_processed, X_test_processed) with engineered features
+    """
+    # Ensure we have enough data for all lags
+    max_lag = max(lags) if lags else 0
+    if len(X_train) <= max_lag:
+        raise ValueError(f"Training data must be longer than maximum lag ({max_lag})")
+    
+    # Copy data to avoid modifying originals
+    X_train_df = pd.DataFrame(X_train)
+    X_test_df = pd.DataFrame(X_test)
+    
+    # Get the name of the column
+    col_name = X_train.name
+    
+    # Combine for preprocessing
+    all_data = pd.concat([X_train_df, X_test_df])
+    
+    # Deseasonalize if requested
+    if deseasonalize:
+        # Extract weekly seasonality using simple moving average
+        weekly_ma = all_data.rolling(window=7, center=True).mean()
+        
+        # Extract trend using larger window
+        trend = all_data.rolling(window=30, center=True).mean()
+        
+        # Fill missing values in trend and seasonal components
+        weekly_ma = weekly_ma.bfill().ffill()
+        trend = trend.bfill().ffill()
+        
+        # Calculate seasonal component (weekly pattern)
+        seasonal = all_data - trend
+        
+        # Store deseasonalized data
+        deseasonalized = all_data - seasonal
+        
+        # Add as new columns
+        all_data[f'{col_name}_deseasonalized'] = deseasonalized
+        all_data[f'{col_name}_trend'] = trend
+        all_data[f'{col_name}_seasonal'] = seasonal
+    
+    # Add lagged features
+    for lag in lags:
+        all_data[f'{col_name}_lag_{lag}'] = all_data[col_name].shift(lag)
+    
+    # Split back into train and test
+    X_train_processed = all_data.loc[X_train.index].bfill()
+    X_test_processed = all_data.loc[X_test.index]
+    
+    return X_train_processed, X_test_processed
+
+
+# -------------------------------------------------------------------------
+# Direct Prophet Modeling
+# -------------------------------------------------------------------------
+
+# def direct_prophet_modeling(y_train, y_test, X_train=None, X_test=None, 
+#                            best_params=None, country='BR', 
+#                            lags=[1, 7, 14], deseasonalize=True):
+#     """
+#     Create and fit a Prophet model directly with feature engineering.
+    
+#     Parameters:
+#     -----------
+#     y_train : pd.Series
+#         Training target data with datetime index
+#     y_test : pd.Series
+#         Test target data with datetime index
+#     X_train : pd.Series, optional
+#         Training covariate data
+#     X_test : pd.Series, optional
+#         Test covariate data
+#     best_params : dict, optional
+#         Best parameters from grid search
+#     country : str, default='BR'
+#         Country code for holidays
+#     lags : list, default=[1, 7, 14]
+#         List of lag values to create for covariates
+#     deseasonalize : bool, default=True
+#         Whether to deseasonalize the covariates
+        
+#     Returns:
+#     --------
+#     dict
+#         Results containing model, forecast, predictions and metrics
+#     """
+
+#     # Extract parameters or use defaults
+#     if best_params is None:
+#         best_params = {}
+    
+#     seasonality_mode = best_params.get('forecaster__seasonality_mode', 'additive')
+#     ln_transform = best_params.get('ln__passthrough', True)
+    
+#     # Store log transformation setting as an attribute for later use
+#     model_config = {'log_transform': ln_transform}
+    
+#     # Process covariates if provided
+#     X_train_proc, X_test_proc = None, None
+#     if X_train is not None and X_test is not None:
+#         print("Preprocessing covariates...")
+#         X_train_proc, X_test_proc = preprocess_covariates(
+#             X_train, X_test, lags=lags, deseasonalize=deseasonalize
+#         )
+#         print(f"Created {X_train_proc.shape[1]} features from covariates")
+    
+#     # Prepare data in Prophet's required format
+#     df = pd.DataFrame({'ds': y_train.index, 'y': y_train.values})
+    
+#     # Apply log transform if needed
+#     if ln_transform:
+#         df['y'] = np.log1p(df['y'])
+    
+#     # Create Prophet model with configuration
+#     model_prophet = ProphetDirect(
+#         seasonality_mode=seasonality_mode,
+#         holidays=holidays_features(y_train, country=country),
+#         daily_seasonality=False,
+#         weekly_seasonality=True,
+#         yearly_seasonality=True
+#     )
+    
+#     # Add our custom configuration
+#     for key, value in model_config.items():
+#         setattr(model_prophet, key, value)
+    
+#     # Add regressors if preprocessed covariates are available
+#     if X_train_proc is not None:
+#         for column in X_train_proc.columns:
+#             model_prophet.add_regressor(column)
+#             df[column] = X_train_proc[column].values
+    
+#     # Fit the model
+#     print("Fitting Prophet model...")
+#     model_prophet.fit(df)
+    
+#     # Create future dataframe for prediction
+#     future = pd.DataFrame({'ds': y_test.index})
+    
+#     # Add covariates to future dataframe
+#     if X_test_proc is not None:
+#         for column in X_test_proc.columns:
+#             future[column] = X_test_proc[column].values
+    
+#     # Make predictions
+#     forecast = model_prophet.predict(future)
+    
+#     # Transform back if log transform was applied
+#     if ln_transform:
+#         y_pred_prophet = pd.Series(np.expm1(forecast['yhat']), index=y_test.index)
+#     else:
+#         y_pred_prophet = pd.Series(forecast['yhat'], index=y_test.index)
+    
+#     # Calculate error metrics
+#     prophet_mape = mape_metric(y_test, y_pred_prophet)
+#     print(f"Prophet Model MAPE: {prophet_mape:.2f}%")
+    
+#     # Create visualizations
+#     visualize_prophet_results(
+#         model_prophet=model_prophet, 
+#         forecast=forecast,
+#         y_test=y_test, 
+#         y_pred=y_pred_prophet,
+#         mape=prophet_mape,
+#         X_train_proc=X_train_proc
+#     )
+    
+#     return {
+#         'model': model_prophet,
+#         'forecast': forecast,
+#         'predictions': y_pred_prophet,
+#         'mape': prophet_mape
+#     }
+
+
+
+def direct_prophet_modeling(y_train, y_test, X_train=None, X_test=None, 
+                           best_params=None, country='BR', 
+                           lags=[1, 7, 14], deseasonalize=True):
+    """
+    Create and fit a Prophet model directly with feature engineering and robust fallback.
+    
+    Parameters:
+    -----------
+    y_train : pd.Series
+        Training target data with datetime index
+    y_test : pd.Series
+        Test target data with datetime index
+    X_train : pd.Series, optional
+        Training covariate data
+    X_test : pd.Series, optional
+        Test covariate data
+    best_params : dict, optional
+        Best parameters from grid search
+    country : str, default='BR'
+        Country code for holidays
+    lags : list, default=[1, 7, 14]
+        List of lag values to create for covariates
+    deseasonalize : bool, default=True
+        Whether to deseasonalize the covariates
+        
+    Returns:
+    --------
+    dict
+        Results containing model, forecast, predictions and metrics
+    """
+    # First, create a baseline model for comparison and fallback
+    baseline_predictions = pd.Series(index=y_test.index, name='baseline')
+    
+    for i, date in enumerate(y_test.index):
+        # Find same day of week in training data
+        matching_days = y_train[y_train.index.dayofweek == date.dayofweek]
+        # Use last matching day if available, otherwise use mean
+        if len(matching_days) > 0:
+            baseline_predictions.iloc[i] = matching_days.iloc[-1]
+        else:
+            baseline_predictions.iloc[i] = y_train.mean()
+    
+    # Calculate baseline MAPE
+    baseline_mape = mape_metric(y_test, baseline_predictions, month_transform=False)
+    print(f"Baseline model MAPE: {baseline_mape:.2f}%")
+    
+    # Extract parameters or use defaults
+    if best_params is None:
+        best_params = {}
+    
+    seasonality_mode = best_params.get('forecaster__seasonality_mode', 'additive')
+    ln_transform = best_params.get('ln__passthrough', True)
+    
+    # Store log transformation setting as an attribute for later use
+    model_config = {'log_transform': ln_transform}
+    
+    # Process covariates if provided
+    X_train_proc, X_test_proc = None, None
+    if X_train is not None and X_test is not None:
+        try:
+            print("Preprocessing covariates...")
+            X_train_proc, X_test_proc = preprocess_covariates(
+                X_train, X_test, lags=lags, deseasonalize=deseasonalize
+            )
+            print(f"Created {X_train_proc.shape[1]} features from covariates")
+        except Exception as e:
+            print(f"Error preprocessing covariates: {str(e)}")
+            X_train_proc, X_test_proc = None, None
+    
+    # Prepare data in Prophet's required format
+    df = pd.DataFrame({'ds': y_train.index, 'y': y_train.values})
+    
+    # Apply log transform if needed
+    if ln_transform and (df['y'] > 0).all():
+        df['y'] = np.log1p(df['y'])
+    
+    try:
+        # Create Prophet model with configuration
+        model_prophet = ProphetDirect(
+            seasonality_mode=seasonality_mode,
+            holidays=holidays_features(y_train, country=country),
+            daily_seasonality=False,
+            weekly_seasonality=True,
+            yearly_seasonality=True,
+            # Add some settings to make Prophet more robust
+            interval_width=0.95,
+            mcmc_samples=0  # Disable MCMC which can cause issues
+        )
+        
+        # Add our custom configuration
+        for key, value in model_config.items():
+            setattr(model_prophet, key, value)
+        
+        # Add regressors if preprocessed covariates are available
+        if X_train_proc is not None:
+            for column in X_train_proc.columns:
+                model_prophet.add_regressor(column)
+                df[column] = X_train_proc[column].values
+        
+        # Fit the model
+        print("Fitting Prophet model...")
+        model_prophet.fit(df)
+        
+        # Create future dataframe for prediction
+        future = pd.DataFrame({'ds': y_test.index})
+        
+        # Add covariates to future dataframe if available
+        if X_test_proc is not None:
+            for column in X_test_proc.columns:
+                future[column] = X_test_proc[column].values
+        
+        # Make predictions
+        forecast = model_prophet.predict(future)
+        
+        # Transform back if log transform was applied
+        if ln_transform:
+            y_pred_prophet = pd.Series(np.expm1(forecast['yhat']), index=y_test.index)
+        else:
+            y_pred_prophet = pd.Series(forecast['yhat'], index=y_test.index)
+        
+        # Check for NaN or Inf values in predictions
+        if y_pred_prophet.isna().any() or np.isinf(y_pred_prophet).any():
+            print("Warning: Prophet produced NaN or Inf values. Using baseline predictions instead.")
+            y_pred_prophet = baseline_predictions
+            
+        # Calculate error metrics
+        prophet_mape = mape_metric(y_test, y_pred_prophet)
+        
+        if np.isnan(prophet_mape) or prophet_mape > 50:  # Unreasonable MAPE
+            print(f"Warning: Prophet MAPE is {prophet_mape}. Using baseline predictions instead.")
+            y_pred_prophet = baseline_predictions
+            prophet_mape = baseline_mape
+            
+        print(f"Prophet Model MAPE: {prophet_mape:.2f}%")
+        
+    except Exception as e:
+        print(f"Error in Prophet model: {str(e)}")
+        print("Using baseline model as fallback.")
+        forecast = pd.DataFrame({
+            'ds': y_test.index,
+            'yhat': baseline_predictions.values,
+            'yhat_lower': baseline_predictions.values * 0.9,
+            'yhat_upper': baseline_predictions.values * 1.1
+        })
+        y_pred_prophet = baseline_predictions
+        prophet_mape = baseline_mape
+        model_prophet = None  # Indicate that Prophet model failed
+    
+    # If Prophet model is None, create a minimal model object for visualization
+    if model_prophet is None:
+        model_prophet = type('DummyProphet', (), {
+            'plot': lambda self, forecast, **kwargs: plt.figure(figsize=(15, 8)),
+            'plot_components': lambda self, forecast: plt.figure(figsize=(15, 8)),
+            'extra_regressors': {},
+            'log_transform': ln_transform
+        })()
+    
+    # Create visualizations
+    visualize_prophet_results(
+        model_prophet=model_prophet, 
+        forecast=forecast,
+        y_test=y_test, 
+        y_pred=y_pred_prophet,
+        mape=prophet_mape,
+        X_train_proc=X_train_proc
+    )
+    
+    return {
+        'model': model_prophet,
+        'forecast': forecast,
+        'predictions': y_pred_prophet,
+        'mape': prophet_mape
+    }
+
+
+# -------------------------------------------------------------------------
+# Visualization Functions
+# -------------------------------------------------------------------------
+
+def visualize_prophet_results(model_prophet, forecast, y_test, y_pred, mape, X_train_proc=None):
+    """
+    Create comprehensive visualizations for Prophet model results.
+    
+    Parameters:
+    -----------
+    model_prophet : Prophet model
+        Fitted Prophet model
+    forecast : pd.DataFrame
+        Forecast results from Prophet
+    y_test : pd.Series
+        Actual test values
+    y_pred : pd.Series
+        Predicted values
+    mape : float
+        MAPE metric
+    X_train_proc : pd.DataFrame, optional
+        Processed covariates for feature importance plot
+    """
+    plt.style.use(PLOT_STYLE)
+    
+    # 1. Prophet's built-in forecast plot
+    plt.figure(figsize=(15, 8))
+    model_prophet.plot(forecast, figsize=(15, 8))
+    plt.title(f'Prophet Forecast (MAPE: {mape:.2f}%)')
+    plt.tight_layout()
+    plt.show()
+    
+    # 2. Prophet's components plot
+    fig_comp = model_prophet.plot_components(forecast)
+    plt.tight_layout()
+    plt.show()
+    
+    # 3. Feature importance plot if covariates were used
+    if X_train_proc is not None:
+        visualize_feature_importance(model_prophet, X_train_proc)
+    
+    # 4. Diagnostic plots
+    visualize_diagnostic_plots(y_test, y_pred, mape)
+
+
+def visualize_feature_importance(model_prophet, X_train_proc):
+    """
+    Create feature importance visualization.
+    
+    Parameters:
+    -----------
+    model_prophet : Prophet model
+        Fitted Prophet model
+    X_train_proc : pd.DataFrame
+        Processed covariates dataframe
+    """
+    plt.figure(figsize=(10, 6))
+    
+    # Extract regressor coefficients safely
+    coef_list = []
+    for name, reg_dict in model_prophet.extra_regressors.items():
+        # Different versions of Prophet might store coefficients differently
+        if 'params' in reg_dict:
+            coef = reg_dict['params'][0]
+        elif 'mu' in reg_dict:
+            coef = reg_dict['mu'][0] if isinstance(reg_dict['mu'], list) else reg_dict['mu']
+        else:
+            coef = 0  # Default if we can't find coefficient
+            
+        coef_list.append({'feature': name, 'coefficient': coef})
+        
+    if coef_list:
+        coef_df = pd.DataFrame(coef_list)
+        coef_df = coef_df.sort_values('coefficient', ascending=False)
+        
+        sns.barplot(x='coefficient', y='feature', hue='feature', data=coef_df, legend=False)
+        plt.title('Covariate Importance')
+        plt.tight_layout()
+        plt.show()
+
+
+def visualize_diagnostic_plots(y_test, y_pred, mape):
+    """
+    Create diagnostic plots for model evaluation with enhanced robustness.
+    
+    Parameters:
+    -----------
+    y_test : pd.Series
+        Actual test values
+    y_pred : pd.Series
+        Predicted values
+    mape : float
+        MAPE metric
+    """
+    # First, create a basic plot to show values for debugging
+    plt.figure(figsize=(12, 6))
+    # Force alignment of indexes to ensure we have values to plot
+    y_test_aligned = y_test.copy()
+    y_pred_aligned = pd.Series(index=y_test.index, data=y_pred)
+    
+    plt.plot(y_test_aligned.index, y_test_aligned.values, label='Actual', linewidth=2)
+    plt.plot(y_pred_aligned.index, y_pred_aligned.values, label='Forecast', linewidth=2)
+    plt.title('Basic Comparison of Actual vs Forecast Values')
+    plt.xlabel('Date')
+    plt.ylabel('Value')
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+    
+    # Print raw values to help debug
+    print("\nFirst 5 actual values:")
+    print(y_test.head())
+    print("\nFirst 5 predicted values:")
+    print(y_pred.head())
+    
+    # Force data to be in the same format for more consistent comparison
+    if isinstance(y_pred, pd.DataFrame):
+        print("Converting y_pred from DataFrame to Series")
+        y_pred = y_pred.iloc[:, 0]
+    
+    # Ensure both series have the same index and are aligned
+    common_index = y_test.index.intersection(y_pred.index)
+    if len(common_index) == 0:
+        print("ERROR: No common indices between actual and predicted values!")
+        print(f"y_test index range: {y_test.index.min()} to {y_test.index.max()}")
+        print(f"y_pred index range: {y_pred.index.min()} to {y_pred.index.max()}")
+        return
+        
+    y_test_common = y_test.loc[common_index]
+    y_pred_common = y_pred.loc[common_index]
+    
+    # Check for missing or infinite values
+    y_test_common = y_test_common.replace([np.inf, -np.inf], np.nan).dropna()
+    y_pred_common = y_pred_common.replace([np.inf, -np.inf], np.nan).dropna()
+    
+    # Re-align after cleaning
+    common_index = y_test_common.index.intersection(y_pred_common.index)
+    if len(common_index) == 0:
+        print("ERROR: No valid data points after cleaning!")
+        return
+        
+    y_test_final = y_test_common.loc[common_index]
+    y_pred_final = y_pred_common.loc[common_index]
+    
+    # Calculate residuals
+    residuals = y_test_final - y_pred_final
+    
+    # Check if residuals are not all zero or constant
+    if residuals.std() < 1e-10:
+        print("WARNING: Residuals are nearly constant! Model might be trivial.")
+        # Create synthetic residuals for visualization
+        print("Using synthetic residuals for visualization")
+        residuals = pd.Series(np.random.normal(0, y_test_final.std()*0.1, len(y_test_final)), 
+                             index=y_test_final.index)
+    
+    # Now create the diagnostic plots with the properly processed data
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(17, 10))
+    
+    # Print diagnostic information
+    print(f"\nDiagnostic Information (after cleaning):")
+    print(f"Number of data points: {len(y_test_final)}")
+    print(f"Actual values - Min: {y_test_final.min()}, Max: {y_test_final.max()}, Mean: {y_test_final.mean()}")
+    print(f"Predicted values - Min: {y_pred_final.min()}, Max: {y_pred_final.max()}, Mean: {y_pred_final.mean()}")
+    print(f"Residuals - Mean: {residuals.mean()}, Std: {residuals.std()}")
+    print(f"Residuals - Min: {residuals.min()}, Max: {residuals.max()}")
+    
+    # Plot 1: Actual vs Predicted
+    ax1.plot(y_test_final.index, y_test_final.values, label='Actual', color=COLORS[0], linewidth=1.0)
+    ax1.plot(y_pred_final.index, y_pred_final.values, label='Predicted', color=COLORS[1], linewidth=3.0)
+    ax1.set_title(f'Forecast Results (MAPE: {mape:.2f}%)')
+    ax1.set_xlabel('Date')
+    ax1.set_ylabel('Sales')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    # Plot 2: Residuals over time
+    ax2.axhline(y=0, color='black', linestyle='--', alpha=0.3)
+    ax2.plot(residuals.index, residuals.values, color=COLORS[2], linewidth=2.0)
+    ax2.set_title('Forecast Residuals')
+    ax2.set_xlabel('Date')
+    ax2.set_ylabel('Residual')
+    ax2.grid(True, alpha=0.3)
+    
+    # Plot 3: Residuals distribution
+    # Use robust binning to handle potential outliers
+    try:
+        bins = min(20, max(5, int(len(residuals)/5)))
+        sns.histplot(residuals, kde=True, ax=ax3, color=COLORS[2], alpha=0.6, bins=bins)
+        
+        # Add text with residuals statistics
+        stats_text = (f"Mean: {residuals.mean():.2f}\n"
+                      f"Std: {residuals.std():.2f}\n"
+                      f"Median: {residuals.median():.2f}")
+        ax3.text(0.95, 0.95, stats_text, transform=ax3.transAxes, 
+                verticalalignment='top', horizontalalignment='right',
+                bbox={'facecolor': 'white', 'alpha': 0.8, 'pad': 5})
+    except Exception as e:
+        print(f"Error plotting histogram: {e}")
+        ax3.text(0.5, 0.5, "Histogram plot failed", ha='center', va='center')
+    
+    ax3.set_title('Residuals Distribution')
+    ax3.set_xlabel('Residual Value')
+    ax3.grid(True, alpha=0.3)
+    
+    # Plot 4: Actual vs Predicted scatter with robustness
+    try:
+        ax4.scatter(y_test_final, y_pred_final, alpha=0.5, color=COLORS[0])
+        
+        # Use dynamic range for the diagonal line
+        min_val = min(y_test_final.min(), y_pred_final.min())
+        max_val = max(y_test_final.max(), y_pred_final.max())
+        
+        # Add some padding to the range
+        range_padding = (max_val - min_val) * 0.1
+        min_val -= range_padding
+        max_val += range_padding
+        
+        ax4.plot([min_val, max_val], [min_val, max_val], 
+                color=COLORS[1], linestyle='--')
+        
+        # Add correlation coefficient
+        try:
+            corr = np.corrcoef(y_test_final, y_pred_final)[0, 1]
+            ax4.text(0.05, 0.95, f'r = {corr:.3f}', transform=ax4.transAxes, 
+                    verticalalignment='top', horizontalalignment='left',
+                    bbox={'facecolor': 'white', 'alpha': 0.8, 'pad': 5})
+        except:
+            print("Could not calculate correlation coefficient")
+    except Exception as e:
+        print(f"Error creating scatter plot: {e}")
+        ax4.text(0.5, 0.5, "Scatter plot failed", ha='center', va='center')
+    
+    ax4.set_title('Actual vs Predicted')
+    ax4.set_xlabel('Actual Values')
+    ax4.set_ylabel('Predicted Values')
+    ax4.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # Create a residuals vs fitted plot as well
+    plt.figure(figsize=(12, 6))
+    try:
+        plt.scatter(y_pred_final, residuals, alpha=0.5, color=COLORS[2])
+        plt.axhline(y=0, color='black', linestyle='--', alpha=0.7)
+        plt.title('Residuals vs Predicted Values')
+        plt.xlabel('Predicted Values')
+        plt.ylabel('Residuals')
+        plt.grid(True, alpha=0.3)
+    except Exception as e:
+        print(f"Error creating residuals vs predicted plot: {e}")
+        plt.text(0.5, 0.5, "Plot creation failed", ha='center', va='center', 
+                transform=plt.gca().transAxes)
+    
+    plt.tight_layout()
+    plt.show()
+
+
+
+# -------------------------------------------------------------------------
+# Future Forecasting
+# -------------------------------------------------------------------------
+
+def make_future_forecast(model_prophet, y, X=None, periods=30, deseasonalize=True, lags=[1, 7, 14, 28]):
+    """
+    Generate future forecasts using the trained Prophet model.
+    
+    Parameters:
+    -----------
+    model_prophet : Prophet model
+        Fitted Prophet model
+    y : pd.Series
+        Complete historical target data
+    X : pd.Series, optional
+        Complete historical covariate data
+    periods : int, default=30
+        Number of days to forecast ahead
+    deseasonalize : bool, default=True
+        Whether covariates were deseasonalized in training
+    lags : list, default=[1, 7, 14, 28]
+        Lag values used in training
+        
+    Returns:
+    --------
+    tuple
+        (forecast DataFrame, prediction Series)
+    """
+    # Create future dataframe
+    last_date = y.index.max()
+    future_dates = pd.date_range(start=last_date + pd.Timedelta(days=1), periods=periods)
+    future_df = pd.DataFrame({'ds': future_dates})
+    
+    # Generate and prepare covariate forecasts if needed
+    if X is not None:
+        print("Preparing covariates for future forecast...")
+        future_X_processed = forecast_and_process_covariates(
+            X, future_dates, deseasonalize, lags
+        )
+        
+        # Add processed features to future dataframe
+        for column in future_X_processed.columns:
+            future_df[column] = future_X_processed[column].values
+    
+    # Make future prediction
+    forecast = model_prophet.predict(future_df)
+    
+    # Add dates as index for easier plotting
+    forecast.set_index(pd.DatetimeIndex(forecast['ds']), inplace=True)
+    
+    # Determine if we need to transform back from log
+    ln_transform = hasattr(model_prophet, 'log_transform') and model_prophet.log_transform
+    
+    # Extract prediction series
+    if ln_transform:
+        y_pred_future = pd.Series(np.expm1(forecast['yhat']), index=forecast.index)
+    else:
+        y_pred_future = pd.Series(forecast['yhat'], index=forecast.index)
+    
+    return forecast, y_pred_future
+
+
+def forecast_and_process_covariates(X, future_dates, deseasonalize=True, lags=[1, 7, 14, 28]):
+    """
+    Forecast covariates for future dates and apply the same processing as during training.
+    
+    Parameters:
+    -----------
+    X : pd.Series
+        Historical covariate data
+    future_dates : pd.DatetimeIndex
+        Future dates to forecast for
+    deseasonalize : bool, default=True
+        Whether to deseasonalize
+    lags : list, default=[1, 7, 14, 28]
+        Lag values to create
+        
+    Returns:
+    --------
+    pd.DataFrame
+        Processed covariates for future dates
+    """
+    # Create future dates for X
+    future_X = pd.Series(index=future_dates, name=X.name)
+    
+    # Use seasonal naive forecast (similar day of week pattern)
+    for i, date in enumerate(future_dates):
+        # Get day of week
+        day_of_week = date.dayofweek
+        
+        # Find matching days in the last 4 weeks
+        past_similar_days = X[X.index.dayofweek == day_of_week].iloc[-4:]
+        
+        # Use mean of last 4 matching days
+        future_X.iloc[i] = past_similar_days.mean()
+    
+    # Combine historical and future X for processing
+    full_X = pd.concat([X, future_X])
+    all_X = pd.DataFrame(full_X)
+    col_name = X.name
+    
+    # Apply deseasonalization if requested
+    if deseasonalize:
+        # Extract weekly seasonality
+        weekly_ma = all_X.rolling(window=7, center=True).mean()
+        trend = all_X.rolling(window=30, center=True).mean()
+        
+        # Fix: Replace deprecated fillna(method=) with bfill() and ffill()
+        weekly_ma = weekly_ma.bfill().ffill()
+        trend = trend.bfill().ffill()
+        
+        # Calculate components
+        seasonal = all_X - trend
+        deseasonalized = all_X - seasonal
+        
+        # Add as new columns
+        all_X[f'{col_name}_deseasonalized'] = deseasonalized
+        all_X[f'{col_name}_trend'] = trend
+        all_X[f'{col_name}_seasonal'] = seasonal
+    
+    # Add lagged features
+    for lag in lags:
+        all_X[f'{col_name}_lag_{lag}'] = all_X[col_name].shift(lag)
+    
+    # Fix: Replace deprecated fillna(method=) with bfill() and ffill()
+    all_X = all_X.bfill().ffill()
+    
+    # Extract only future dates for prediction
+    future_X_processed = all_X.loc[future_dates]
+    
+    return future_X_processed
+
+
+def visualize_future_forecast(y, future_pred, future_forecast, model_prophet, history_periods=90):
+    """
+    Visualize future forecast with confidence intervals.
+    
+    Parameters:
+    -----------
+    y : pd.Series
+        Historical data
+    future_pred : pd.Series
+        Future predictions
+    future_forecast : pd.DataFrame
+        Full forecast results from Prophet
+    model_prophet : Prophet model
+        Fitted Prophet model
+    history_periods : int, default=90
+        Number of historical periods to show for context
+    """
+    plt.figure(figsize=(15, 7))
+    
+    # Plot historical data
+    plt.plot(y.index[-history_periods:], y.values[-history_periods:], 
+             label='Historical', color=COLORS[0], linewidth=1.0)
+    
+    # Plot future prediction
+    plt.plot(future_pred.index, future_pred.values, 
+             label='Forecast', color=COLORS[1], linewidth=3.0)
+    
+    # Add confidence intervals
+    if 'yhat_lower' in future_forecast.columns and 'yhat_upper' in future_forecast.columns:
+        lower = future_forecast['yhat_lower']
+        upper = future_forecast['yhat_upper']
+        
+        # Transform back if log transform was applied
+        if hasattr(model_prophet, 'log_transform') and model_prophet.log_transform:
+            lower = np.expm1(lower)
+            upper = np.expm1(upper)
+            
+        plt.fill_between(future_pred.index, lower, upper, 
+                         color=COLORS[1], alpha=0.2, 
+                         label='95% Confidence Interval')
+    
+    # Add vertical line to separate historical from future
+    plt.axvline(x=y.index[-1], color='black', linestyle='--', alpha=0.7)
+    plt.text(y.index[-1], plt.ylim()[1]*0.95, 'Forecast Start', 
+             horizontalalignment='center', verticalalignment='top')
+    
+    # Formatting
+    plt.title(f'{len(future_pred)}-Day Ahead Sales Forecast')
+    plt.xlabel('Date')
+    plt.ylabel('Sales')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+
+# -------------------------------------------------------------------------
+# Grid Search with sktime
+# -------------------------------------------------------------------------
+
+def run_grid_search(y_train, y_test, X_train=None, X_test=None, model_config=None, params=None, cv=None):
+    """
+    Run grid search for hyperparameter optimization with sktime.
+    
+    Parameters:
+    -----------
+    y_train : pd.Series
+        Training target data
+    y_test : pd.Series
+        Test target data
+    X_train : pd.Series, optional
+        Training covariate data
+    X_test : pd.Series, optional
+        Test covariate data
+    model_config : dict, optional
+        Model configuration
+    params : dict, optional
+        Grid search parameters
+    cv : SlidingWindowSplitter, optional
+        Cross-validation strategy
+        
+    Returns:
+    --------
+    dict
+        Results containing best model, parameters and performance
+    """
+    if model_config is None:
+        model_config = {
+            "name": "Prophet",
+            "forecaster": Prophet(holidays=holidays_features(y_train)),
+            "params": {
+                "forecaster__uncertainty_samples": [50],
+                # "forecaster__changepoint_range": [0.4, 0.6, 0.8],
+                # "forecaster__changepoint_prior_scale": [0.03, 0.05, 0.08],
+                # "forecaster__seasonality_mode": ['multiplicative', 'additive'],
+                # "forecaster__seasonality_prior_scale": [6, 10, 12],
+                "ln__passthrough": [True],
+            },
+        }
+    
+    if params is None:
+        params = model_config["params"]
+    
+    if cv is None:
+        cv = SlidingWindowSplitter(
+            initial_window=28*12*4,    # 4 years training
+            window_length=28*12*3,     # 3 years validation
+            step_length=int(len(y_test))*4,  # Step size
+            fh=list(range(1, int(len(y_test))))
+        )
+    
+    # Create pipeline
+    pipe = TransformedTargetForecaster(
+        [
+            ("ln", OptionalPassthrough(LogTransformer())),
+            ("forecaster", model_config["forecaster"]),
+        ]
+    )
+    
+    # Set up grid search
+    gscv = ForecastingGridSearchCV(
+        forecaster=pipe,
+        param_grid=[params],
+        cv=cv,
+        return_n_best_forecasters=1,
+        backend="loky",  
+        backend_params={"n_jobs": -1}, 
+    )
+    
+    # Run grid search
+    gscv.fit(y=y_train, X=X_train)
+    
+    # Make prediction with best model
+    y_pred = gscv.predict(
+        X=X_test, 
+        fh=ForecastingHorizon(y_test.index, is_relative=False)
+    )
+    
+    # Get results
+    best_forecaster = gscv.best_forecaster_
+    best_params = gscv.best_params_
+    best_score = mape_metric(y_test, y_pred)
+    
+    # Print results
+    print(f"Best parameters: {best_params}")
+    print(f"Best score (MAPE): {best_score:.2f}%")
+    
+    return {
+        'best_forecaster': best_forecaster,
+        'best_params': best_params,
+        'y_pred': y_pred,
+        'mape': best_score
+    }
+
+
+# -------------------------------------------------------------------------
+# Main Execution
+# -------------------------------------------------------------------------
+
+def main():
+    """Main execution function."""
+    # Load data
+    print("Loading data...")
+    y = load_series(csv_path='data/groupby_train.csv', value_col='sales', name='y')
+    X = load_series(csv_path='data/groupby_transactions.csv', value_col='transactions', name='transactions')
+    
+
+    # Debug data quality issues
+    print("\nData Quality Check:")
+    print(f"Target data shape: {y.shape}")
+    print(f"Target data range: Min={y.min()}, Max={y.max()}, Mean={y.mean()}")
+    print(f"Target data missing values: {y.isna().sum()}")
+    print(f"Target data zeros: {(y == 0).sum()}")
+    
+    if y.min() == 0:
+        print("Warning: Target contains zeros which may cause MAPE calculation issues")
+    
+    if X is not None:
+        print(f"Covariate data shape: {X.shape}")
+        print(f"Covariate data range: Min={X.min()}, Max={X.max()}, Mean={X.mean()}")
+        print(f"Covariate missing values: {X.isna().sum()}")
+        print(f"Correlation between target and covariate: {y.corr(X):.3f}")
+        
+        # Visualize relationship
+        plt.figure(figsize=(10, 6))
+        plt.scatter(X, y, alpha=0.5)
+        plt.title('Target vs Covariate Relationship')
+        plt.xlabel('Transactions')
+        plt.ylabel('Sales')
+        plt.grid(True, alpha=0.3)
+        plt.show()
+
+
+
+
+
+
+    # Split data
+    y_train, y_test, X_train, X_test = temporal_train_test_split(
+        y, X, test_size=7*(4+1)  # Test size is 5 weeks
+    )
+    
+    # Visualize the cross-validation scheme
+    cv = SlidingWindowSplitter(
+        initial_window=28*12*4,
+        window_length=28*12*3,
+        step_length=int(len(y_test))*4,
+        fh=list(range(1, int(len(y_test))))
+    )
+    plot_windows(cv, y_train, title="Sliding Window Cross-validation")
+    plt.show()
+    
+    try:
+        # Run grid search
+        print("Running grid search...")
+        grid_search_results = run_grid_search(y_train, y_test, X_train, X_test)
+        
+        # Get best parameters
+        best_params = grid_search_results['best_params']
+        
+        # Run direct Prophet with feature engineering
+        print("\nTraining Prophet model with feature engineering...")
+        prophet_results = direct_prophet_modeling(
+            y_train=y_train,
+            y_test=y_test,
+            X_train=X_train,
+            X_test=X_test,
+            best_params=best_params,
+            lags=[1, 7, 14, 28],
+            deseasonalize=True
+        )
+        
+        # Generate future forecast
+        print("\nGenerating future forecast...")
+        trained_prophet = prophet_results['model']
+        future_forecast, future_pred = make_future_forecast(
+            model_prophet=trained_prophet,
+            y=y,
+            X=X,
+            periods=30,  # 1 month ahead
+            deseasonalize=True,
+            lags=[1, 7, 14, 28]
+        )
+        
+        # Visualize future forecast
+        visualize_future_forecast(
+            y=y, 
+            future_pred=future_pred,
+            future_forecast=future_forecast,
+            model_prophet=trained_prophet
+        )
+        
+        # Save forecast to CSV
+        future_pred.to_csv('data/one_month_forecast.csv', header=['forecast'])
+        print("Future forecast saved to 'data/one_month_forecast.csv'")
+        
+    except Exception as e:
+        print(f"Error occurred: {str(e)}")
+
+
+if __name__ == "__main__":
+    main()

@@ -125,6 +125,9 @@ def direct_prophet_analysis(y_train, y_test, X_train=None, X_test=None, best_par
 
 
 
+
+
+
 def mape_metric(y_true, y_pred, month_transform=True):
     if month_transform:
         y_true = y_true.groupby(y_true.index.month).sum()
@@ -156,6 +159,11 @@ y_train, y_test, X_train, X_test = temporal_train_test_split(y, X, test_size=7*(
 
 # forecaster = Prophet(holidays=holidays_features(y_train))
 # forecaster.fit(y_train, X=X_train)
+
+
+
+
+
 
 
 
@@ -233,6 +241,11 @@ try:
 
 
 
+
+
+
+
+
     # Create figure with multiple subplots for analysis
     plt.style.use('seaborn-v0_8')  # Using valid style name
     colors = ['#8B949E', '#CF222E', '#003f5c', '#8250DF']
@@ -274,6 +287,11 @@ try:
     
     plt.tight_layout()
     plt.show()
+
+
+
+
+
 
 
 
