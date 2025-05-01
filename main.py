@@ -534,13 +534,14 @@ def plot_fitted_vs_actuals(model, forecast, y_full, test_size, log_transform=Tru
     fig = plt.figure(figsize=(24, 12))
     
     # Create a gridspec with 2 rows and 4 columns
-    gs = fig.add_gridspec(2, 4, height_ratios=[1, 1.5])
+    gs = fig.add_gridspec(2, 5, height_ratios=[1, 1.5])
     
-    # Create the five subplots
+    # Create the six subplots
     ax1 = fig.add_subplot(gs[0, 0])  # Scatter plot (top-left)
     ax4 = fig.add_subplot(gs[0, 1])  # Residuals histogram (top-middle-left)
     ax3 = fig.add_subplot(gs[0, 2])  # Monthly plot (top-middle-right)
-    ax5 = fig.add_subplot(gs[0, 3])  # NEW: Seasonal patterns (top-right)
+    ax5 = fig.add_subplot(gs[0, 3])  # Weekly seasonality (top-right-1)
+    ax6 = fig.add_subplot(gs[0, 4])  # Monthly seasonality (top-right-2)
     ax2 = fig.add_subplot(gs[1, :])  # Daily plot (full bottom row)
     
 
@@ -678,43 +679,124 @@ def plot_fitted_vs_actuals(model, forecast, y_full, test_size, log_transform=Tru
     
     # Choose what to display - day of week seasonality
     day_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+
+    # Calculate overall average of actual values
+    overall_mean_actual = np.mean(actuals)
     
-    # Group by day of week and calculate mean and std (instead of min/max)
+    # Group by day of week and calculate mean and std
     dow_grouped = seasonal_df.groupby('day_of_week').agg({
         'actual': ['mean', 'std'], 
         'fitted': ['mean', 'std'],
         'residual': ['mean', 'std']
     }).reset_index()
 
+    # Normalize means around 1.0 (percentage of overall average)
+    dow_grouped['actual', 'normalized_mean'] = dow_grouped['actual', 'mean'] / overall_mean_actual
+
     # Set up x positions for plotting
     x = np.arange(len(day_names))
 
-    # Plot mean lines
-    ax5.plot(x, dow_grouped['actual']['mean'], 'o-', color='slategray', linewidth=2, markersize=8, label='Actual (Mean)')
-    # ax5.plot(x, dow_grouped['fitted']['mean'], 'o-', color='tab:red', linewidth=2, markersize=8, label='Fitted (Mean)')
+    # Plot normalized mean lines
+    ax5.plot(x, dow_grouped['actual', 'normalized_mean'], 'o-', color='slategray', 
+            linewidth=2, markersize=8, label='Actual (% of avg)')
 
-    # Plot ±1 std ranges as shaded areas (instead of min-max)
-    ax5.fill_between(x, 
-                    dow_grouped['actual']['mean'] - dow_grouped['actual']['std'], 
-                    dow_grouped['actual']['mean'] + dow_grouped['actual']['std'], 
-                    color='slategray', alpha=0.2, label='Actual (±1σ)')
-    # ax5.fill_between(x, 
-    #                 dow_grouped['fitted']['mean'] - dow_grouped['fitted']['std'], 
-    #                 dow_grouped['fitted']['mean'] + dow_grouped['fitted']['std'], 
-    #                 color='tab:red', alpha=0.2, label='Fitted (±1σ)')
+    # Plot per-day std ranges as shaded areas - using actual std values for each day
+    upper_bound = dow_grouped['actual', 'normalized_mean'] + dow_grouped['actual', 'std'] / overall_mean_actual
+    lower_bound = dow_grouped['actual', 'normalized_mean'] - dow_grouped['actual', 'std'] / overall_mean_actual
+    ax5.fill_between(x, lower_bound, upper_bound, color='slategray', alpha=0.2, label='±1σ per day')
 
+    # Add horizontal line at 1.0 to represent the average
+    ax5.axhline(y=1.0, color='tab:orange', linestyle='--', alpha=0.7, label='Overall Average')
+    
     # Set x-axis labels to day names
     ax5.set_xticks(x)
     ax5.set_xticklabels(day_names, rotation=45)
+
+    # Format y-axis as percentage
+    ax5.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{x:.1f}'))
     
+    # # Add annotations showing percentage difference from average
+    # for i, val in enumerate(dow_grouped['actual', 'normalized_mean']):
+    #     percentage = (val - 1.0) * 100
+    #     color = 'green' if percentage >= 0 else 'red'
+    #     ax5.annotate(f"{percentage:+.1f}%", 
+    #                 (i, val), 
+    #                 xytext=(0, 10 if percentage >= 0 else -15),
+    #                 textcoords="offset points",
+    #                 ha='center',
+    #                 va='center',
+    #                 color=color,
+    #                 fontweight='bold',
+    #                 fontsize=8)
+
     # Add labels and title
     ax5.set_xlabel('Day of Week')
-    ax5.set_ylabel('Average Value')
-    ax5.set_title('Seasonal Pattern by Day of Week')
+    ax5.set_ylabel('Relative to Average (1.0 = Average)')
+    ax5.set_title('Weekly Seasonal Pattern')
     ax5.grid(True, alpha=0.3, axis='y')
-    ax5.legend()
+    ax5.legend(fontsize=8)
 
     
+    # SUBPLOT 6: MONTHLY SEASONALITY
+    # Month names for x-axis
+    month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+
+    # Group by month and calculate statistics
+    month_grouped = seasonal_df.groupby('month').agg({
+        'actual': ['mean', 'std', 'count'], 
+        'fitted': ['mean', 'std'],
+        'residual': ['mean', 'std']
+    }).reset_index()
+
+    # Normalize means around 1.0 (percentage of overall average)
+    month_grouped['actual', 'normalized_mean'] = month_grouped['actual', 'mean'] / overall_mean_actual
+
+    # Valid months and normalized values
+    valid_months = month_grouped['month'].values - 1  # 0-based indexing for plotting
+    normalized_means = month_grouped['actual', 'normalized_mean'].values
+
+    # Calculate per-month upper and lower bounds using each month's actual std
+    upper_bounds = normalized_means + month_grouped['actual', 'std'].values / overall_mean_actual
+    lower_bounds = normalized_means - month_grouped['actual', 'std'].values / overall_mean_actual
+
+    # Plot normalized monthly pattern
+    ax6.plot(valid_months, normalized_means, 'o-', color='slategray', linewidth=2, markersize=8, label='Actual (% of avg)')
+
+    # Plot per-month std ranges
+    ax6.fill_between(valid_months, lower_bounds, upper_bounds, color='slategray', alpha=0.2, label='±1σ per month')
+
+    # Add horizontal line at 1.0 to represent the average
+    ax6.axhline(y=1.0, color='tab:orange', linestyle='--', alpha=0.7, label='Overall Average')
+
+    # Format y-axis as percentage
+    ax6.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{x:.1f}'))
+
+    # # Add annotations showing percentage difference from average
+    # for i, val in enumerate(normalized_means):
+    #     percentage = (val - 1.0) * 100
+    #     color = 'green' if percentage >= 0 else 'red'
+    #     ax6.annotate(f"{percentage:+.1f}%", 
+    #                 (valid_months[i], val), 
+    #                 xytext=(0, 10 if percentage >= 0 else -15),
+    #                 textcoords="offset points",
+    #                 ha='center',
+    #                 va='center',
+    #                 color=color,
+    #                 fontweight='bold',
+    #                 fontsize=8)
+    
+    # Set x-axis labels to month names for valid months
+    ax6.set_xticks(valid_months)
+    ax6.set_xticklabels([month_names[i] for i in valid_months], rotation=45)
+
+    # Add labels and title for monthly seasonality
+    ax6.set_xlabel('Month')
+    ax6.set_ylabel('Relative to Average (1.0 = Average)')
+    ax6.set_title('Monthly Seasonal Pattern')
+    ax6.grid(True, alpha=0.3, axis='y')
+    ax6.legend(fontsize=8)
+
+
     # SUBPLOT 2: Daily time series of actuals and fitted values (same as before)
     ax2.plot(matched_dates, actuals, color='slategray', alpha=1.0, label='Actual Values')
     ax2.plot(matched_dates, fitted_values, color='tab:red', alpha=0.7, label='Fitted Values')
