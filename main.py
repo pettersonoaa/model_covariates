@@ -426,7 +426,7 @@ def calculate_mape(y_true, y_pred):
     return np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100
 
 
-def evaluate_exogenous_variables(y, X, max_lag=28, correlation_types=['pearson', 'spearman'], alpha=0.05):
+def evaluate_exogenous_variables(y, X, max_lag=70, correlation_types=['pearson', 'spearman'], alpha=0.05):
     """
     Evaluate potential exogenous variables through correlation analysis and Granger causality tests.
     
@@ -523,7 +523,7 @@ def evaluate_exogenous_variables(y, X, max_lag=28, correlation_types=['pearson',
         granger_results = {}
         
         # Test for lags 1, 2, 4, 8, etc. up to max_lag
-        lags_to_test = [1, 2, 4, 8, 12, 16, 20, 24, 28]
+        lags_to_test = [1, 2, 3, 4, 5, 6, 7, 14, 21, 28, 35, 42, 49, 56, 63, 70, 77, 84]
         lags_to_test = [lag for lag in lags_to_test if lag <= max_lag]
         
         for lag in lags_to_test:
@@ -1553,124 +1553,214 @@ def plot_components(model, forecast, log_transform=True):
 
 def plot_variable_evaluation_enhanced(eval_results, y, X):
     """
-    Enhanced visualization of covariate evaluation results.
-    
-    Parameters:
-    -----------
-    eval_results : dict
-        Results from evaluate_exogenous_variables function
-    y : pd.Series
-        Target variable
-    X : pd.DataFrame
-        DataFrame of exogenous variables
-    
-    Returns:
-    --------
-    matplotlib.figure.Figure
-        Figure containing the plots
+    Simplified visualization of covariate evaluation results.
+    Shows Granger causality, scatter plots, and monthly time series for each covariate.
     """
-    
-    
-    # Create figure with grid layout
-    fig = plt.figure(figsize=(15, 12))
-    gs = GridSpec(3, 3, figure=fig)
-    
     # Get variable names
     variables = list(eval_results['correlation'].keys())
     if not variables:
-        ax1 = fig.add_subplot(gs[0, 0])
-        ax1.text(0.5, 0.5, "No variables to evaluate", ha='center', va='center')
+        fig = plt.figure(figsize=(10, 6))
+        ax = fig.add_subplot(111)
+        ax.text(0.5, 0.5, "No variables to evaluate", ha='center', va='center')
         return fig
     
-    # CRITICAL FIX: Align the series to ensure they cover the same date range
+    # Align the series to ensure they cover the same date range
     common_idx = y.index.intersection(X.index)
     if len(common_idx) == 0:
-        ax1 = fig.add_subplot(gs[0, 0])
-        ax1.text(0.5, 0.5, "ERROR: No common dates found", ha='center', va='center')
+        fig = plt.figure(figsize=(10, 6))
+        ax = fig.add_subplot(111)
+        ax.text(0.5, 0.5, "ERROR: No common dates found", ha='center', va='center')
         return fig
     
     y_aligned = y.loc[common_idx]
     X_aligned = X.loc[common_idx]
     
-    print(f"Visualization: Using {len(common_idx)} aligned data points")# 3. Variable vs. Target scatter plot (top-right)
-    ax3 = fig.add_subplot(gs[0, 2])
+    print(f"Visualization: Using {len(common_idx)} aligned data points for {len(variables)} covariates")
     
-    if variables:
-        var_name = variables[0]
-        # FIX: Use aligned data instead of original data
-        x_data = X_aligned[var_name].values
-        y_data = y_aligned.values
+    # Create figure with appropriate size (3 columns per variable)
+    fig = plt.figure(figsize=(20, 5 * len(variables)))
+    
+    # For each variable, create a row of plots
+    for var_idx, var_name in enumerate(variables):
+        print(f"Plotting analysis for covariate: {var_name}")
+        
+        # === GRANGER CAUSALITY PLOT (left) ===
+        ax_granger = fig.add_subplot(len(variables), 3, var_idx*3 + 1)
+        
+        if 'granger_causality' in eval_results and var_name in eval_results['granger_causality']:
+            granger_results = eval_results['granger_causality'][var_name]
+            
+            # Extract lags and p-values
+            lags = []
+            pvals = []
+            significant = []
+            
+            for lag, lag_results in granger_results.items():
+                if isinstance(lag, int) and 'ssr_ftest_pval' in lag_results:
+                    lags.append(lag)
+                    pval = lag_results['ssr_ftest_pval']
+                    pvals.append(pval)
+                    significant.append(lag_results.get('significant', False))
+            
+            if lags:
+                # Plot p-values for each lag
+                bar_colors = ['tab:green' if sig else 'tab:red' for sig in significant]
+                ax_granger.bar(lags, pvals, color=bar_colors, alpha=0.7)
+                
+                # Add significance threshold line
+                alpha = 0.05  # Common significance threshold
+                ax_granger.axhline(y=alpha, color='black', linestyle='--', alpha=0.7)
+                ax_granger.text(max(lags), alpha, f'p={alpha} threshold', va='bottom', ha='right', 
+                        bbox=dict(facecolor='white', alpha=0.8))
+                
+                # Determine the best (smallest significant) lag
+                best_lag = None
+                if any(significant):
+                    best_lag = min([lag for i, lag in enumerate(lags) if significant[i]])
+                    
+                if best_lag is not None:
+                    best_idx = lags.index(best_lag)
+                    # Highlight the best lag
+                    ax_granger.bar([best_lag], [pvals[best_idx]], color='tab:blue', alpha=1.0)
+                    ax_granger.annotate(f"Best lag: {best_lag}\np={pvals[best_idx]:.4f}", 
+                                xy=(best_lag, pvals[best_idx]), 
+                                xytext=(best_lag, pvals[best_idx] + 0.1),
+                                arrowprops=dict(facecolor='black', shrink=0.05, width=1.5),
+                                ha='center', va='bottom',
+                                bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="b"))
+                    
+                    # Add visual indicator for Granger causality at this lag
+                    ax_granger.text(0.02, 0.02, 
+                            f"{var_name} Granger causes Target\nat lag {best_lag} (p={pvals[best_idx]:.4f})",
+                            transform=ax_granger.transAxes, 
+                            fontsize=10, ha='left', va='bottom',
+                            bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.8))
+                else:
+                    ax_granger.text(0.5, 0.5, f"No significant Granger causality found", 
+                            transform=ax_granger.transAxes, ha='center', va='center',
+                            bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
+                    
+                ax_granger.set_xticks(lags)
+                ax_granger.set_xticklabels([str(lag) for lag in lags])
+                ax_granger.set_yscale('log')  # Log scale for better visualization
+                ax_granger.set_ylim(top=1.0)  # Maximum p-value is 1.0
+                
+                ax_granger.set_title(f'Granger Causality: {var_name} → Target')
+                ax_granger.set_xlabel('Lag')
+                ax_granger.set_ylabel('p-value (log scale)')
+                ax_granger.grid(True, axis='y', alpha=0.3)
+            else:
+                ax_granger.text(0.5, 0.5, f"No Granger causality results", 
+                        transform=ax_granger.transAxes, ha='center', va='center')
+        
+        # === SCATTER PLOT (middle) ===
+        ax_scatter = fig.add_subplot(len(variables), 3, var_idx*3 + 2)
+        
+        # Get data for this variable
+        var_data = X_aligned[var_name].values
+        target_data = y_aligned.values
         
         # Plot scatter
-        ax3.scatter(x_data, y_data, alpha=0.6, edgecolors='w', linewidth=0.5)
+        ax_scatter.scatter(var_data, target_data, alpha=0.6, edgecolors='w', linewidth=0.5)
         
         # Add trend line
         try:
-            mask = ~np.isnan(x_data) & ~np.isnan(y_data)
+            mask = ~np.isnan(var_data) & ~np.isnan(target_data)
             if mask.sum() > 1:  # Need at least 2 points for regression
-                z = np.polyfit(x_data[mask], y_data[mask], 1)
+                z = np.polyfit(var_data[mask], target_data[mask], 1)
                 p = np.poly1d(z)
-                x_range = np.linspace(min(x_data[mask]), max(x_data[mask]), 100)
-                ax3.plot(x_range, p(x_range), 'r--', linewidth=2)
+                x_range = np.linspace(min(var_data[mask]), max(var_data[mask]), 100)
+                ax_scatter.plot(x_range, p(x_range), 'r--', linewidth=2)
                 
                 # Add R²
                 from scipy import stats
-                r_squared = stats.pearsonr(x_data[mask], y_data[mask])[0]**2
-                ax3.text(0.05, 0.95, f'R² = {r_squared:.3f}', transform=ax3.transAxes,
+                r_squared = stats.pearsonr(var_data[mask], target_data[mask])[0]**2
+                ax_scatter.text(0.05, 0.95, f'R² = {r_squared:.3f}', transform=ax_scatter.transAxes,
                         va='top', ha='left', bbox=dict(facecolor='white', alpha=0.8))
         except Exception as e:
-            print(f"Error fitting trend line: {e}")
+            print(f"Error fitting trend line for {var_name}: {e}")
         
-        ax3.set_title(f'Target vs. {var_name}')
-        ax3.set_xlabel(var_name)
-        ax3.set_ylabel('Target')
-        ax3.grid(True, alpha=0.3)
-    
-    # 4. Time series plot of target and variable (bottom row)
-    ax4 = fig.add_subplot(gs[1:, :])
-    
-    if variables:
-        var_name = variables[0]
+        ax_scatter.set_title(f'Target vs. {var_name}')
+        ax_scatter.set_xlabel(var_name)
+        ax_scatter.set_ylabel('Target')
+        ax_scatter.grid(True, alpha=0.3)
         
-        # FIX: Use aligned data for time series plot too
-        ax4.plot(y_aligned.index, y_aligned, label='Target', color='steelblue', alpha=0.8)
+        # === NEW: MONTHLY TIME SERIES PLOT (right) ===
+        ax_monthly = fig.add_subplot(len(variables), 3, var_idx*3 + 3)
         
-        # Create twin y-axis for the exogenous variable
-        ax4_twin = ax4.twinx()
-        ax4_twin.plot(X_aligned.index, X_aligned[var_name], label=var_name, color='darkred', alpha=0.8)
+        # Create DataFrames for resampling
+        target_series = pd.Series(target_data, index=y_aligned.index, name='Target')
+        covar_series = pd.Series(var_data, index=X_aligned.index, name=var_name)
         
-        # Format dates on x-axis
+        # Resample to monthly frequency and take the mean
+        monthly_target = target_series.resample('ME').mean()
+        monthly_covar = covar_series.resample('ME').mean()
+        
+        # Plot monthly target data on left y-axis
+        color1 = 'steelblue'
+        ax_monthly.plot(monthly_target.index, monthly_target.values, 
+                      color=color1, linewidth=2, marker='o', markersize=4,
+                      label='Target')
+        ax_monthly.set_ylabel('Target Value', color=color1)
+        ax_monthly.tick_params(axis='y', labelcolor=color1)
+        
+        # Create twin axis for covariate
+        ax_monthly_twin = ax_monthly.twinx()
+        
+        # Plot monthly covariate data on right y-axis
+        color2 = 'darkred'
+        ax_monthly_twin.plot(monthly_covar.index, monthly_covar.values, 
+                           color=color2, linewidth=2, marker='s', markersize=4,
+                           label=var_name)
+        ax_monthly_twin.set_ylabel(f'{var_name} Value', color=color2)
+        ax_monthly_twin.tick_params(axis='y', labelcolor=color2)
+        
+        # Calculate correlation at monthly level
+        monthly_df = pd.DataFrame({
+            'target': monthly_target,
+            'covariate': monthly_covar
+        })
+        monthly_df = monthly_df.dropna()  # Remove any NaN values
+        
+        if len(monthly_df) > 1:
+            monthly_corr = monthly_df['target'].corr(monthly_df['covariate'])
+            ax_monthly.text(0.05, 0.95, f'Monthly Correlation: {monthly_corr:.3f}', 
+                          transform=ax_monthly.transAxes, fontsize=10,
+                          va='top', ha='left', 
+                          bbox=dict(facecolor='white', alpha=0.8))
+        
+        # Format x-axis dates
         import matplotlib.dates as mdates
-        ax4.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
-        ax4.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
-        plt.setp(ax4.xaxis.get_majorticklabels(), rotation=45)
+        ax_monthly.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+        ax_monthly.xaxis.set_major_locator(mdates.MonthLocator(interval=3))  # Every 3 months
+        plt.setp(ax_monthly.xaxis.get_majorticklabels(), rotation=45)
         
-        # Add labels
-        ax4.set_title(f'Time Series: Target and {var_name}')
-        ax4.set_xlabel('Date')
-        ax4.set_ylabel('Target', color='steelblue')
-        ax4_twin.set_ylabel(var_name, color='darkred')
+        # Add grid
+        ax_monthly.grid(True, alpha=0.3)
         
-        # Add legends
-        lines1, labels1 = ax4.get_legend_handles_labels()
-        lines2, labels2 = ax4_twin.get_legend_handles_labels()
-        ax4.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
+        # Add combined legend
+        lines1, labels1 = ax_monthly.get_legend_handles_labels()
+        lines2, labels2 = ax_monthly_twin.get_legend_handles_labels()
+        ax_monthly.legend(lines1 + lines2, labels1 + labels2, loc='upper center', 
+                        bbox_to_anchor=(0.5, -0.15), ncol=2)
         
-        ax4.grid(True, alpha=0.3)
+        ax_monthly.set_title(f'Monthly {var_name} vs. Target')
+        
+        # Add recommendation banners if available
+        for rec in eval_results.get('recommended_vars', []):
+            if rec['variable'] == var_name:
+                recommendation = f"RECOMMENDATION: {var_name} is recommended\nReason: {rec['reason']}"
+                fig.text(0.5, 0.98 - (var_idx/len(variables)), recommendation,
+                         ha='center', va='top', fontsize=12,
+                         bbox=dict(facecolor='lightyellow', alpha=0.9, boxstyle='round'))
+                break
     
-    # Add overall title with recommendations
-    if 'recommended_vars' in eval_results and eval_results['recommended_vars']:
-        rec = eval_results['recommended_vars'][0]
-        recommendation = (f"RECOMMENDATION: {rec['variable']} is recommended\n"
-                         f"Reason: {rec['reason']}")
-        fig.suptitle(recommendation, fontsize=16, y=0.99, 
-                    bbox=dict(facecolor='lightyellow', alpha=0.9, boxstyle='round'))
-    
+    # Add overall title
+    fig.suptitle("Variable Evaluation Analysis", fontsize=16, y=0.99)
     plt.tight_layout()
-    plt.subplots_adjust(top=0.93)
+    plt.subplots_adjust(top=0.95, hspace=0.4, bottom=0.1)
     
     return fig
-
 
 def export_model_artifacts(results, output_dir='exports', include_plots=True):
     """
@@ -1816,7 +1906,7 @@ def run_prophet_pipeline(
     country_code=None,
     date_dummies=None,
     evaluate_covariates=True,
-    max_lag_for_evaluation=28
+    max_lag_for_evaluation=70
 ):
     """
     Run the complete Prophet forecasting pipeline.
