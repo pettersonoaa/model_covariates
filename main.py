@@ -20,6 +20,7 @@ from statsmodels.tsa.stattools import grangercausalitytests
 from matplotlib.gridspec import GridSpec
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 import statsmodels.api as sm
+import warnings
 
 # Configure logging to suppress Prophet and cmdstanpy output
 logging.getLogger('prophet').setLevel(logging.WARNING)
@@ -527,8 +528,11 @@ def evaluate_exogenous_variables(y, X, max_lag=28, correlation_types=['pearson',
         
         for lag in lags_to_test:
             try:
-                gc_res = grangercausalitytests(data, maxlag=lag, verbose=False)
-                
+                # Suppress FutureWarning about verbose parameter
+                with warnings.catch_warnings():
+                    warnings.filterwarnings('ignore', category=FutureWarning)
+                    gc_res = grangercausalitytests(data, maxlag=lag, verbose=False)
+
                 # Extract p-values for different test statistics
                 ssr_ftest_pval = gc_res[lag][0]['ssr_ftest'][1]
                 granger_results[lag] = {
@@ -805,7 +809,10 @@ def generate_future_forecast(model, forecast, future_periods, X_cols=None, X_df=
             
             # 1. Generate weekend features
             for col in date_pattern_cols['weekend']:
-                future[col] = (future_dates.dt.dayofweek >= 5).astype(int)
+                # Change this line:
+                # future[col] = (future_dates.dt.dayofweek >= 5).astype(int)
+                # To:
+                future[col] = (future_dates.dayofweek >= 5).astype(int)
                 print(f"Calculated {col} based on weekend days (Sat/Sun)")
             
             # 2. Generate day of week features
@@ -813,8 +820,10 @@ def generate_future_forecast(model, forecast, future_periods, X_cols=None, X_df=
                 try:
                     # Extract day number from column name (is_dayofweek_1 -> 1)
                     day_num = int(col.split('_')[-1])
-                    # Check if the day of week matches
-                    future[col] = (future_dates.dt.dayofweek == (day_num - 1) % 7).astype(int)
+                    # Change this line:
+                    # future[col] = (future_dates.dt.dayofweek == (day_num - 1) % 7).astype(int)
+                    # To:
+                    future[col] = (future_dates.dayofweek == (day_num - 1) % 7).astype(int)
                     print(f"Calculated {col} based on day of week {day_num}")
                 except (ValueError, IndexError):
                     print(f"Warning: Couldn't parse day number from {col}, using zero")
@@ -825,7 +834,10 @@ def generate_future_forecast(model, forecast, future_periods, X_cols=None, X_df=
                 try:
                     # Extract month number from column name (is_month_1 -> 1)
                     month_num = int(col.split('_')[-1])
-                    future[col] = (future_dates.dt.month == month_num).astype(int)
+                    # Change this line:
+                    # future[col] = (future_dates.dt.month == month_num).astype(int)
+                    # To:
+                    future[col] = (future_dates.month == month_num).astype(int)
                     print(f"Calculated {col} based on month {month_num}")
                 except (ValueError, IndexError):
                     print(f"Warning: Couldn't parse month number from {col}, using zero")
@@ -836,7 +848,10 @@ def generate_future_forecast(model, forecast, future_periods, X_cols=None, X_df=
                 try:
                     # Extract day number from column name (is_day_1 -> 1)
                     day_num = int(col.split('_')[-1])
-                    future[col] = (future_dates.dt.day == day_num).astype(int)
+                    # Change this line:
+                    # future[col] = (future_dates.dt.day == day_num).astype(int)
+                    # To:
+                    future[col] = (future_dates.day == day_num).astype(int)
                     print(f"Calculated {col} based on day of month {day_num}")
                 except (ValueError, IndexError):
                     print(f"Warning: Couldn't parse day number from {col}, using zero")
@@ -1355,7 +1370,7 @@ def plot_fitted_vs_actuals(model, forecast, y_full, test_size, log_transform=Tru
     ts_df.set_index('date', inplace=True)
     
     # Resample to monthly frequency and take the mean
-    monthly_df = ts_df.resample('M').mean()
+    monthly_df = ts_df.resample('ME').mean()
     
     # Plot monthly data
     ax3.plot(monthly_df.index, monthly_df['actual'], color='slategray', linewidth=2, alpha=1.0, label='Actual Values')
@@ -1474,139 +1489,15 @@ def plot_forecast(model, forecast, y_full, test_size, X_cols=None, date_dummies=
     
     # Add future forecast if requested
     if future_periods > 0:
-        try:
-            print("\nGenerating future forecast...")
-            
-            # CRITICAL FIX: Create future dates directly instead of using make_future_dataframe + filtering
-            # Get the most recent date in the original forecast
-            last_date = pd.to_datetime(forecast['ds'].iloc[-1])
-            
-            # Create future dataframe with dates starting from the day after last_date
-            future_dates = pd.date_range(
-                start=last_date + pd.Timedelta(days=1),
-                periods=future_periods,
-                freq='D'
-            )
-            
-            # Create dataframe with these dates
-            future = pd.DataFrame({'ds': future_dates})
-            print(f"Created future dataframe with {len(future)} rows from {future['ds'].min().date()} to {future['ds'].max().date()}")
-            
-            # If we have regressors, we need to add them to the future dataframe
-            if X_cols:
-                print(f"Adding regressor values for future prediction...")
-                dummy_cols = [col for col in X_cols if '_dummy' in col]
-                continuous_cols = [col for col in X_cols if col not in dummy_cols]
-                
-
-
-
-
-                # print(X_df[col])
-
-
-
-
-
-
-
-
-                # For continuous values, get actual values from original dataset if available
-                for col in continuous_cols:
-                    # Check if column exists in the forecast
-                    if col in forecast.columns:
-                        # Get the original covariate data loaded at the beginning of the pipeline
-                        original_covariate = X_df[col] if isinstance(X_df, pd.DataFrame) and col in X_df else None
-                        print(col) ########################################
-                        print(X_df[col]) ########################################
-                        if original_covariate is not None:
-                            # Try to map future dates to actual values in the original dataset
-                            future_filled = False
-                            future_values = []
-                            
-                            for future_date in future_dates:
-                                if future_date in original_covariate.index:
-                                    # Use actual value from dataset for this date
-                                    future_values.append(original_covariate.loc[future_date])
-                                    future_filled = True
-                                else:
-                                    # If date not found, use last known value
-                                    print(f"No future data found in original dataset. Using last known value {X_df[col].iloc[-1]:.4f} for {col} on {future_date.date()}")
-                                    future_values.append(X_df[col].iloc[-1])
-                            
-                            if future_filled:
-                                # At least some dates were found in the original dataset
-                                print(f"Using actual values from original dataset for {col} where available")
-                                future[col] = future_values
-                            else:
-                                # No dates found, fall back to last known value
-                                last_value = forecast[col].iloc[-1]
-                                print(f"No future data found in original dataset. Using last known value {last_value:.4f} for {col}")
-                                future[col] = last_value
-                        else:
-                            # Original covariate not available, use last known value
-                            last_value = forecast[col].iloc[-1]
-                            print(f"Using last known value {last_value:.4f} for {col}")
-                            future[col] = last_value
-                    else:
-                        print(f"Warning: {col} not found in forecast. Using zero.")
-                        future[col] = 0
-                
-                # For dummy variables, use the date patterns
-                if dummy_cols and date_dummies:
-                    print(f"Recalculating date dummies: {dummy_cols}")
-                    relevant_patterns = [p for p in date_dummies if p['name'] in dummy_cols]
-                    if relevant_patterns:
-                        future = add_date_dummies(future, relevant_patterns)
-            
-            print(f"Future dataframe shape: {future.shape}, dates from {future['ds'].min()} to {future['ds'].max()}")
-            
-            # Make the future prediction
-            future_forecast = model.predict(future)
-            
-            # Debug raw predictions
-            print(f"Raw future prediction range: [{future_forecast['yhat'].min():.4f} to {future_forecast['yhat'].max():.4f}]")
-            
-            # Apply inverse transform
-            future_yhat = future_forecast['yhat'].values
-            future_yhat_lower = future_forecast['yhat_lower'].values 
-            future_yhat_upper = future_forecast['yhat_upper'].values
-            
-            if log_transform:
-                future_yhat = np.expm1(future_yhat)
-                future_yhat_lower = np.expm1(future_yhat_lower)
-                future_yhat_upper = np.expm1(future_yhat_upper)
-            
-            # Debug transformed values
-            print(f"Transformed future range: [{np.min(future_yhat):.2f} to {np.max(future_yhat):.2f}], mean: {np.mean(future_yhat):.2f}")
-            
-            # Check if values seem reasonable compared to test data
-            test_mean = np.mean(yhat[-test_size:])
-            future_mean = np.mean(future_yhat)
-            ratio = future_mean / test_mean
-            
-            if ratio < 0.1 or ratio > 10:
-                print(f"WARNING: Future forecast mean ({future_mean:.2f}) is very different from test data mean ({test_mean:.2f})")
-                print("This suggests potential scaling issues. Attempting to fix...")
-                
-                # If values are extremely small, apply a correction
-                if ratio < 0.1:
-                    scaling_factor = test_mean / future_mean if future_mean > 0 else test_mean
-                    future_yhat = future_yhat * scaling_factor
-                    future_yhat_lower = future_yhat_lower * scaling_factor
-                    future_yhat_upper = future_yhat_upper * scaling_factor
-                    print(f"Applied scaling factor of {scaling_factor:.2f} to make values visible")
-            
+        # Use the new function
+        future_forecast, future_dates, future_yhat, future_yhat_lower, future_yhat_upper = generate_future_forecast(
+            model, forecast, future_periods, X_cols, X_df, date_dummies, log_transform
+        )
+        
+        if future_forecast is not None:
             # Plot the future forecast
-            future_dates = pd.to_datetime(future_forecast['ds']) #linestyle='dashed',
-            ax.plot(future_dates, future_yhat, color='tab:orange', linewidth=2,  label='Forecast')
+            ax.plot(future_dates, future_yhat, color='tab:orange', linewidth=2, label='Forecast')
             ax.fill_between(future_dates, future_yhat_lower, future_yhat_upper, color='tab:orange', alpha=0.1)
-            
-        except Exception as e:
-            print(f"Error generating future forecast: {e}")
-            import traceback
-            traceback.print_exc()
-
     
     # Add vertical line to separate train and test data
     ax.axvline(x=train_dates[-1], color='tab:blue', linewidth=1, linestyle='--')
