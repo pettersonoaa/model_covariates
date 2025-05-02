@@ -16,72 +16,31 @@ import pickle
 import os
 from scipy import stats
 from statsmodels.stats.stattools import durbin_watson
-from statsmodels.tsa.stattools import grangercausalitytests
-from matplotlib.gridspec import GridSpec
-from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
-import statsmodels.api as sm
 
 # Configure logging to suppress Prophet and cmdstanpy output
 logging.getLogger('prophet').setLevel(logging.WARNING)
 logging.getLogger('cmdstanpy').setLevel(logging.ERROR)
 
 
-def load_data(target_path, covariate_path=None, date_col='date', target_col='sales', covariate_cols=None):
-    """
-    Load target and optional covariate data with support for multiple covariates.
-    
-    Parameters:
-    -----------
-    target_path : str
-        Path to the target CSV file
-    covariate_path : str, optional
-        Path to the covariate CSV file
-    date_col : str, default='date'
-        Name of the date column
-    target_col : str, default='sales'
-        Name of the target column
-    covariate_cols : list, optional
-        List of covariate column names to load. If None, defaults to ['transactions']
-    """
+def load_data(target_path, covariate_path=None, date_col='date', target_col='sales', covariate_col='transactions'):
+    """Load target and optional covariate data."""
     # Load target data
     target_df = pd.read_csv(target_path, parse_dates=[date_col])
     target_series = pd.Series(target_df[target_col].values, index=pd.DatetimeIndex(target_df[date_col]), name=target_col)
     
     # Load covariate data if provided
-    covariate_df = None
+    covariate_series = None
     if covariate_path:
-        # Default to 'transactions' if no columns specified
-        if covariate_cols is None:
-            covariate_cols = ['transactions']
-            
-        # Read the full covariate file
-        temp_df = pd.read_csv(covariate_path, parse_dates=[date_col])
-        
-        # Show available columns for reference
-        print(f"Available columns in covariate file: {', '.join(temp_df.columns)}")
-        
-        # Check which columns actually exist in the file
-        available_cols = [col for col in covariate_cols if col in temp_df.columns]
-        missing_cols = [col for col in covariate_cols if col not in temp_df.columns]
-        
-        if missing_cols:
-            print(f"WARNING: The following requested covariates are not in the file: {missing_cols}")
-        
-        if not available_cols:
-            print(f"ERROR: None of the requested covariates {covariate_cols} are in the file!")
-            return target_series, None
-            
-        # Extract just the columns we need (with date index)
-        covariate_df = pd.DataFrame(index=pd.DatetimeIndex(temp_df[date_col]))
-        for col in available_cols:
-            covariate_df[col] = temp_df[col].values
+        covariate_df = pd.read_csv(covariate_path, parse_dates=[date_col])
+        covariate_series = pd.Series(covariate_df[covariate_col].values, 
+                                    index=pd.DatetimeIndex(covariate_df[date_col]), 
+                                    name=covariate_col)
     
     print(f"Loaded target data: {len(target_series)} points, spanning {target_series.index.min()} to {target_series.index.max()}")
-    if covariate_df is not None:
-        print(f"Loaded covariate data: {len(covariate_df)} points with {len(covariate_df.columns)} variables")
-        print(f"Covariates: {', '.join(covariate_df.columns)}")
+    if covariate_series is not None:
+        print(f"Loaded covariate data: {len(covariate_series)} points")
         
-    return target_series, covariate_df
+    return target_series, covariate_series
 
 def get_country_holidays(country_code, start_date, end_date, pre_post_days=1):
     """
@@ -146,12 +105,8 @@ def add_date_dummies(df, date_patterns):
     DataFrame
         Original DataFrame with added dummy columns
     """
-    # Create a copy to avoid modifying the original
     result_df = df.copy()
     dates = pd.to_datetime(df['ds'])
-    
-    # Create a mapping from date to index position for efficient lookup
-    date_to_idx = {date: i for i, date in enumerate(dates)}  # ADD THIS LINE
     
     for pattern in date_patterns:
         name = pattern['name']
@@ -161,7 +116,7 @@ def add_date_dummies(df, date_patterns):
         window_before = pattern.get('window_before', 0)
         window_after = pattern.get('window_after', 0)
         
-        # Initialize dummy column with zeros as float type
+        # Initialize dummy column with zeros as float type to avoid dtype warnings
         result_df[name] = 0.0  # Use 0.0 instead of 0 to ensure float dtype
         
         # Check for pattern matches
@@ -178,121 +133,70 @@ def add_date_dummies(df, date_patterns):
         if specific_dates:
             for date_str in specific_dates:
                 specific_date = pd.to_datetime(date_str)
-                # Find indices where dates match
-                matching_indices = dates == specific_date
-                result_df.loc[matching_indices, name] = 1.0
+                result_df.loc[dates == specific_date, name] = 1.0  # Use 1.0 instead of 1
         
         # Apply window effects if requested
         if window_before > 0 or window_after > 0:
             # Get indices of all 1s - MORE ROBUST METHOD:
-            match_indices = result_df[name] > 0.9
-            match_dates = dates[match_indices]
-
+            match_dates = dates[result_df[name] > 0.9]  # Use > 0.9 instead of == 1 for float comparison
+            
             if not match_dates.empty:
-                # Create temporary Series for efficient updates
-                temp_values = result_df[name].copy()
-                
                 # Loop through all dates in the dataset
-                for current_date, current_idx in date_to_idx.items():
-                    # Check if this date is within window of any match date
+                for i, current_date in enumerate(dates):
+                    # Check if this date is within window_before days before any match date
                     for match_date in match_dates:
                         days_before = (match_date - current_date).days
                         if 0 < days_before <= window_before:
                             # Gradually decreasing effect
                             effect = 1.0 - (days_before / (window_before + 1))
-                            temp_values.iloc[current_idx] = max(temp_values.iloc[current_idx], effect)
+                            result_df.loc[i, name] = max(result_df.loc[i, name], effect)
                         
-                        # Check if this date is within window_after days after
+                        # Check if this date is within window_after days after any match date
                         days_after = (current_date - match_date).days
                         if 0 < days_after <= window_after:
                             # Gradually decreasing effect
                             effect = 1.0 - (days_after / (window_after + 1))
-                            temp_values.iloc[current_idx] = max(temp_values.iloc[current_idx], effect)
-                
-                # Update the column with all changes at once
-                result_df[name] = temp_values
+                            result_df.loc[i, name] = max(result_df.loc[i, name], effect)
     
     return result_df
 
 def apply_log_transform(series, epsilon=1e-9):
-    """
-    Apply log transformation to a series or DataFrame, handling zeros and negative values.
-    """
-    # Handle Series vs DataFrame
-    if isinstance(series, pd.Series):
-        # Create a copy to avoid modifying the original
-        transformed = series.copy()
-        
-        # Replace zeros and negative values with epsilon
-        zero_mask = transformed <= 0
-        if zero_mask.any():
-            n_zeros = zero_mask.sum()
-            print(f"Found {n_zeros} zero/negative values in {series.name}. Replacing with {epsilon} before log transform.")
-            transformed[zero_mask] = epsilon
-        
-        # Apply log transform
-        log_transformed = np.log1p(transformed)  # log1p(x) = log(1 + x)
-        log_transformed.name = f"log_{series.name}"
-        
-    else:  # DataFrame
-        # Create a copy to avoid modifying the original
-        log_transformed = pd.DataFrame(index=series.index)
-        
-        # Process each column separately
-        for col in series.columns:
-            col_series = series[col]
-            
-            # Replace zeros and negative values with epsilon
-            zero_mask = col_series <= 0
-            if zero_mask.any():
-                n_zeros = zero_mask.sum()
-                print(f"Found {n_zeros} zero/negative values in {col}. Replacing with {epsilon} before log transform.")
-                col_series.loc[zero_mask] = epsilon
-            
-            # Apply log transform
-            log_transformed[col] = np.log1p(col_series)  # log1p(x) = log(1 + x)
-            
+    """Apply log transformation to a series, handling zeros and negative values."""
+    # Create a copy to avoid modifying the original
+    transformed = series.copy()
+    
+    # Replace zeros and negative values with epsilon
+    zero_mask = transformed <= 0
+    if zero_mask.any():
+        n_zeros = zero_mask.sum()
+        print(f"Found {n_zeros} zero/negative values in {series.name}. Replacing with {epsilon} before log transform.")
+        transformed[zero_mask] = epsilon
+    
+    # Apply log transform
+    log_transformed = np.log1p(transformed)  # log1p(x) = log(1 + x)
+    log_transformed.name = f"log_{series.name}"
+    
     return log_transformed
 
 
-def add_lags(data, lags=[1, 7, 14]):
-    """
-    Create lag features from a time series or multiple time series.
-    """
-    df = pd.DataFrame(index=data.index)
+def add_lags(series, lags=[1, 7, 14]):
+    """Create lag features from a time series."""
+    df = pd.DataFrame(index=series.index)
+    df[series.name] = series
     
-    # Handle Series or DataFrame
-    if isinstance(data, pd.Series):
-        # Convert Series to DataFrame
-        df[data.name] = data
-        columns = [data.name]
-    else:
-        # Copy DataFrame columns
-        for col in data.columns:
-            df[col] = data[col]
-        columns = list(data.columns)
+    for lag in lags:
+        df[f"{series.name}_lag_{lag}"] = series.shift(lag)
     
-    # Create lag features for each column
-    for col in columns:
-        for lag in lags:
-            df[f"{col}_lag_{lag}"] = df[col].shift(lag)
-    
-    # Fill NAs created by shifting
+    # Fill NAs created by shifting - using recommended methods instead of deprecated fillna(method='...')
     df = df.bfill().ffill()
     
     return df
 
 
-def prepare_prophet_data(y, X=None, X_df=None, lags=[1, 7, 14], log_transform=True, date_dummies=None):
+def prepare_prophet_data(y, X=None, lags=[1, 7, 14], log_transform=True, date_dummies=None):
     """Prepare data for Prophet with transformations."""
     # Start with Prophet's required format
     df = pd.DataFrame({'ds': y.index, 'y': y.values})
-    # Create a copy of X_df if provided
-    X_df_desaligned = None
-    if X_df is not None:
-        # CRITICAL FIX: Add 'ds' column to X_df_desaligned
-        X_df_desaligned = X_df.copy()
-        X_df_desaligned['ds'] = X_df.index  # Add date column using the index
     
     # Apply log transform to y if requested
     if log_transform:
@@ -301,40 +205,25 @@ def prepare_prophet_data(y, X=None, X_df=None, lags=[1, 7, 14], log_transform=Tr
     
     # Process covariates if provided
     if X is not None:
-        # CRITICAL FIX: Align X with y's index to ensure same dates
-        X_desaligned = X.copy()
-        if isinstance(X, pd.Series):
-            X_aligned = X.reindex(y.index)
-            print(f"Aligned covariates: original length {len(X)}, aligned length {len(X_aligned)}")
-        else:  # DataFrame
-            X_aligned = X.reindex(y.index)
-            print(f"Aligned covariates: original shape {X.shape}, aligned shape {X_aligned.shape}")
-            
         # Apply log transform to X if requested
         if log_transform:
-            X_transformed = apply_log_transform(X_aligned)
-            X_transformed_desaligned = apply_log_transform(X_desaligned)
+            X_transformed = apply_log_transform(X)
         else:
-            X_transformed = X_aligned.copy()
-            X_transformed_desaligned = X_desaligned.copy()
+            X_transformed = X.copy()
         
         # Create lag features
         X_with_lags = add_lags(X_transformed, lags)
-        X_with_lags_desaligned = add_lags(X_transformed_desaligned, lags)
         
         # Add each feature to the Prophet dataframe
         for col in X_with_lags.columns:
             df[col] = X_with_lags[col].values
-            if X_df_desaligned is not None:
-                X_df_desaligned[col] = X_with_lags_desaligned[col].values
     
     # Add date dummies if specified
     if date_dummies:
         df = add_date_dummies(df, date_dummies)
-        X_df_desaligned = add_date_dummies(X_df_desaligned, date_dummies)
     
     print(f"Prepared data for Prophet with {df.shape[1]} columns")
-    return df, X_df_desaligned
+    return df
 
 
 def split_data(df, test_size=30):
@@ -423,180 +312,6 @@ def calculate_mape(y_true, y_pred):
     
     # Calculate MAPE only for non-zero y_true values
     return np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100
-
-
-def evaluate_exogenous_variables(y, X, max_lag=28, correlation_types=['pearson', 'spearman'], alpha=0.05):
-    """
-    Evaluate potential exogenous variables through correlation analysis and Granger causality tests.
-    
-    Parameters:
-    -----------
-    y : pd.Series
-        Target time series
-    X : pd.DataFrame or pd.Series
-        DataFrame containing potential exogenous variables
-    max_lag : int, default=28
-        Maximum lag to consider for Granger causality tests
-    correlation_types : list, default=['pearson', 'spearman']
-        Types of correlation coefficients to calculate
-    alpha : float, default=0.05
-        Significance level for Granger causality tests
-    
-    Returns:
-    --------
-    dict
-        Dictionary containing evaluation results
-    """
-    results = {
-        'correlation': {},
-        'granger_causality': {},
-        'recommended_vars': []
-    }
-    
-    # Ensure X is a DataFrame
-    if isinstance(X, pd.Series):
-        X = pd.DataFrame({X.name: X})
-        
-    print(f"Evaluating {len(X.columns)} potential exogenous variables...")
-    
-    # CRITICAL FIX: Align the series to ensure they cover the same date range
-    common_idx = y.index.intersection(X.index)
-    if len(common_idx) == 0:
-        print("ERROR: No common dates found between target and covariates!")
-        return results
-    
-    y_aligned = y.loc[common_idx]
-    X_aligned = X.loc[common_idx]
-    
-    print(f"Aligned data: {len(y_aligned)} points (target: {len(y)}, covariates: {len(X)})")
-    
-    # 1. Calculate correlation for each variable using aligned data
-    for col in X_aligned.columns:
-        results['correlation'][col] = {}
-        
-        # Calculate contemporaneous correlation
-        for corr_type in correlation_types:
-            corr = X_aligned[col].corr(y_aligned, method=corr_type)
-            results['correlation'][col]['contemporaneous_' + corr_type] = corr
-        
-        # Calculate lagged correlation
-        lag_corrs = []
-        for lag in range(1, min(max_lag + 1, len(X_aligned) // 4)):
-            for corr_type in correlation_types:
-                # Ensure both arrays have the same length
-                y_lagged = y_aligned[lag:].values
-                x_lagged = X_aligned[col][:-lag].values
-                
-                if len(y_lagged) == len(x_lagged):
-                    if corr_type == 'pearson':
-                        corr = np.corrcoef(y_lagged, x_lagged)[0, 1]
-                    else:  # spearman
-                        corr = stats.spearmanr(y_lagged, x_lagged)[0]
-                    
-                    if not np.isnan(corr):
-                        lag_corrs.append((lag, corr_type, corr))
-                else:
-                    print(f"Warning: Length mismatch for lag {lag}, y_shape={len(y_lagged)}, x_shape={len(x_lagged)}")
-        
-        # Store the max lagged correlation
-        if lag_corrs:
-            max_lag_corr = max(lag_corrs, key=lambda x: abs(x[2]))
-            results['correlation'][col]['max_lagged'] = {
-                'lag': max_lag_corr[0],
-                'type': max_lag_corr[1],
-                'value': max_lag_corr[2]
-            }
-    
-    # 2. Perform Granger causality tests with aligned data
-    # Create DataFrame with aligned data
-    combined_data = pd.DataFrame({'y': y_aligned})
-    for col in X_aligned.columns:
-        combined_data[col] = X_aligned[col]
-    
-    # Remove any NaN values
-    combined_data = combined_data.dropna()
-    
-    # Test for each variable
-    for col in X.columns:
-        data = combined_data[['y', col]].values
-        granger_results = {}
-        
-        # Test for lags 1, 2, 4, 8, etc. up to max_lag
-        lags_to_test = [1, 2, 4, 8, 12, 16, 20, 24, 28]
-        lags_to_test = [lag for lag in lags_to_test if lag <= max_lag]
-        
-        for lag in lags_to_test:
-            try:
-                gc_res = grangercausalitytests(data, maxlag=lag, verbose=False)
-                
-                # Extract p-values for different test statistics
-                ssr_ftest_pval = gc_res[lag][0]['ssr_ftest'][1]
-                granger_results[lag] = {
-                    'ssr_ftest_pval': ssr_ftest_pval,
-                    'significant': ssr_ftest_pval < alpha
-                }
-            except Exception as e:
-                print(f"Granger test failed for {col} at lag {lag}: {e}")
-                granger_results[lag] = {'error': 'Test failed'}
-        
-        results['granger_causality'][col] = granger_results
-        
-        # Check if any lag is significant
-        any_significant = any(info.get('significant', False) for lag, info in granger_results.items())
-        
-        # Get best lag (smallest significant lag)
-        if any_significant:
-            best_lag = min([lag for lag, info in granger_results.items() 
-                           if info.get('significant', False)], default=None)
-        else:
-            best_lag = None
-        
-        results['granger_causality'][col]['any_significant'] = any_significant
-        results['granger_causality'][col]['best_lag'] = best_lag
-    
-    # 3. Recommend variables based on criteria
-    for col in X.columns:
-        # Strong contemporaneous correlation (absolute value > 0.3)
-        if abs(results['correlation'][col].get('contemporaneous_pearson', 0)) > 0.3:
-            results['recommended_vars'].append({
-                'variable': col,
-                'reason': 'Strong contemporaneous correlation',
-                'value': results['correlation'][col].get('contemporaneous_pearson'),
-                'score': abs(results['correlation'][col].get('contemporaneous_pearson', 0))
-            })
-        
-        # Strong lagged correlation (absolute value > 0.3)
-        if 'max_lagged' in results['correlation'][col]:
-            if abs(results['correlation'][col]['max_lagged']['value']) > 0.3:
-                results['recommended_vars'].append({
-                    'variable': col,
-                    'reason': f"Strong lagged correlation at lag {results['correlation'][col]['max_lagged']['lag']}",
-                    'value': results['correlation'][col]['max_lagged']['value'],
-                    'score': abs(results['correlation'][col]['max_lagged']['value'])
-                })
-        
-        # Significant Granger causality
-        if results['granger_causality'][col].get('any_significant', False):
-            best_lag = results['granger_causality'][col].get('best_lag')
-            pval = results['granger_causality'][col][best_lag]['ssr_ftest_pval']
-            results['recommended_vars'].append({
-                'variable': col,
-                'reason': f"Granger causes target at lag {best_lag} (p={pval:.4f})",
-                'value': 1 - pval,  # Convert p-value to a "strength" score
-                'score': 1 - pval
-            })
-    
-    # Remove duplicates and sort by strength
-    seen = set()
-    unique_recommendations = []
-    for rec in sorted(results['recommended_vars'], key=lambda x: x['score'], reverse=True):
-        if rec['variable'] not in seen:
-            unique_recommendations.append(rec)
-            seen.add(rec['variable'])
-    
-    results['recommended_vars'] = unique_recommendations
-    
-    return results
 
 
 def analyze_regressor_importance(model, forecast):
@@ -719,213 +434,6 @@ def plot_regressor_importance(importance, top_n=None, show=True):
         plt.show()
     
     return fig
-
-
-
-def generate_future_forecast(model, forecast, future_periods, X_cols=None, X_df=None, 
-                          date_dummies=None, log_transform=True):
-    """
-    Generate forecast for future periods beyond the existing forecast.
-    
-    Parameters:
-    -----------
-    model : Prophet model
-        The trained Prophet model
-    forecast : DataFrame
-        The existing forecast DataFrame from model.predict()
-    future_periods : int
-        Number of periods to forecast into the future
-    X_cols : list, optional
-        List of regressor column names
-    X_df : DataFrame, optional
-        Original covariate DataFrame with potential future values
-    date_dummies : list of dict, optional
-        Custom date patterns to add as dummy variables
-    log_transform : bool, default=True
-        Whether log transform was applied
-        
-    Returns:
-    --------
-    tuple
-        (future_forecast, future_dates, future_values, future_lower, future_upper)
-        - future_forecast: DataFrame with full Prophet forecast results
-        - future_dates: DatetimeIndex of future dates
-        - future_values: array of predicted values (inverse transformed if needed)
-        - future_lower: array of lower bounds (inverse transformed if needed)
-        - future_upper: array of upper bounds (inverse transformed if needed)
-    """
-    if future_periods <= 0:
-        return None, None, None, None, None
-        
-    try:
-        print("\nGenerating future forecast...")
-        
-        # Get the most recent date in the original forecast
-        last_date = pd.to_datetime(forecast['ds'].iloc[-1])
-        
-        # Create future dataframe with dates starting from the day after last_date
-        future_dates = pd.date_range(
-            start=last_date + pd.Timedelta(days=1),
-            periods=future_periods,
-            freq='D'
-        )
-        
-        # Create dataframe with these dates
-        future = pd.DataFrame({'ds': future_dates})
-        print(f"Created future dataframe with {len(future)} rows from {future['ds'].min().date()} to {future['ds'].max().date()}")
-        
-        # If we have regressors, we need to add them to the future dataframe
-        if X_cols:
-            print(f"Adding regressor values for future prediction...")
-            
-            # Categorize columns by type
-            date_pattern_cols = {
-                'weekday': [],      # Features based on day of week (0-6)
-                'weekend': [],      # Weekend indicators
-                'month': [],        # Month-based features
-                'day': [],          # Day of month features
-                'dummy_dates': [],  # Holiday or specific date dummies
-                'continuous': []    # Regular continuous variables
-            }
-            
-            # Classify each column based on its name pattern
-            for col in X_cols:
-                if col == 'is_weekend':
-                    date_pattern_cols['weekend'].append(col)
-                elif col.startswith('is_dayofweek_'):
-                    date_pattern_cols['weekday'].append(col)
-                elif col.startswith('is_month_'):
-                    date_pattern_cols['month'].append(col)
-                elif col.startswith('is_day_'):
-                    date_pattern_cols['day'].append(col)
-                elif col.endswith('_dummy'):
-                    date_pattern_cols['dummy_dates'].append(col)
-                else:
-                    date_pattern_cols['continuous'].append(col)
-            
-            # 1. Generate weekend features
-            for col in date_pattern_cols['weekend']:
-                future[col] = (future_dates.dt.dayofweek >= 5).astype(int)
-                print(f"Calculated {col} based on weekend days (Sat/Sun)")
-            
-            # 2. Generate day of week features
-            for col in date_pattern_cols['weekday']:
-                try:
-                    # Extract day number from column name (is_dayofweek_1 -> 1)
-                    day_num = int(col.split('_')[-1])
-                    # Check if the day of week matches
-                    future[col] = (future_dates.dt.dayofweek == (day_num - 1) % 7).astype(int)
-                    print(f"Calculated {col} based on day of week {day_num}")
-                except (ValueError, IndexError):
-                    print(f"Warning: Couldn't parse day number from {col}, using zero")
-                    future[col] = 0
-            
-            # 3. Generate month-based features
-            for col in date_pattern_cols['month']:
-                try:
-                    # Extract month number from column name (is_month_1 -> 1)
-                    month_num = int(col.split('_')[-1])
-                    future[col] = (future_dates.dt.month == month_num).astype(int)
-                    print(f"Calculated {col} based on month {month_num}")
-                except (ValueError, IndexError):
-                    print(f"Warning: Couldn't parse month number from {col}, using zero")
-                    future[col] = 0
-            
-            # 4. Generate day of month features
-            for col in date_pattern_cols['day']:
-                try:
-                    # Extract day number from column name (is_day_1 -> 1)
-                    day_num = int(col.split('_')[-1])
-                    future[col] = (future_dates.dt.day == day_num).astype(int)
-                    print(f"Calculated {col} based on day of month {day_num}")
-                except (ValueError, IndexError):
-                    print(f"Warning: Couldn't parse day number from {col}, using zero")
-                    future[col] = 0
-                    
-            # 5. Handle dummy date variables through the existing mechanism
-            if date_pattern_cols['dummy_dates'] and date_dummies:
-                relevant_patterns = [p for p in date_dummies if p['name'] in date_pattern_cols['dummy_dates']]
-                if relevant_patterns:
-                    future = add_date_dummies(future, relevant_patterns)
-            
-            # 6. For continuous values, try to use actual data from X_df
-            for col in date_pattern_cols['continuous']:
-                if col in forecast.columns:
-                    # Get the original covariate data loaded at the beginning of the pipeline
-                    original_covariate = X_df[col] if isinstance(X_df, pd.DataFrame) and col in X_df else None
-                    
-                    if original_covariate is not None:
-                        # Try to map future dates to actual values in the original dataset
-                        future_filled = False
-                        future_values = []
-                        
-                        for future_date in future_dates:
-                            if future_date in original_covariate.index:
-                                # Use actual value from dataset for this date
-                                future_values.append(original_covariate.loc[future_date])
-                                future_filled = True
-                            else:
-                                # If date not found, use last known value
-                                future_values.append(X_df[col].iloc[-1])
-                        
-                        if future_filled:
-                            # At least some dates were found in the original dataset
-                            print(f"Using actual values from original dataset for {col} where available")
-                            future[col] = future_values
-                        else:
-                            # No dates found, fall back to last known value
-                            last_value = forecast[col].iloc[-1]
-                            print(f"No future data found in original dataset. Using last known value {last_value:.4f} for {col}")
-                            future[col] = last_value
-                    else:
-                        # Original covariate not available, use last known value
-                        last_value = forecast[col].iloc[-1]
-                        print(f"Using last known value {last_value:.4f} for {col}")
-                        future[col] = last_value
-                else:
-                    print(f"Warning: {col} not found in forecast. Using zero.")
-                    future[col] = 0
-        
-        print(f"Future dataframe shape: {future.shape}, dates from {future['ds'].min()} to {future['ds'].max()}")
-        
-        # Make the future prediction
-        future_forecast = model.predict(future)
-        
-        # Debug raw predictions
-        print(f"Raw future prediction range: [{future_forecast['yhat'].min():.4f} to {future_forecast['yhat'].max():.4f}]")
-        
-        # Apply inverse transform
-        future_yhat = future_forecast['yhat'].values
-        future_yhat_lower = future_forecast['yhat_lower'].values 
-        future_yhat_upper = future_forecast['yhat_upper'].values
-        
-        if log_transform:
-            future_yhat = np.expm1(future_yhat)
-            future_yhat_lower = np.expm1(future_yhat_lower)
-            future_yhat_upper = np.expm1(future_yhat_upper)
-        
-        # Debug transformed values
-        print(f"Transformed future range: [{np.min(future_yhat):.2f} to {np.max(future_yhat):.2f}], mean: {np.mean(future_yhat):.2f}")
-        
-        # Verify forecast looks reasonable compared to historical data
-        test_mean = np.mean(forecast['yhat'].values[-future_periods:])
-        if log_transform:
-            test_mean = np.expm1(test_mean)
-            
-        future_mean = np.mean(future_yhat)
-        ratio = future_mean / test_mean if test_mean > 0 else float('inf')
-        
-        if ratio < 0.1 or ratio > 10:
-            print(f"WARNING: Future forecast mean ({future_mean:.2f}) is very different from recent historical mean ({test_mean:.2f})")
-        
-        return future_forecast, future_dates, future_yhat, future_yhat_lower, future_yhat_upper
-        
-    except Exception as e:
-        print(f"Error generating future forecast: {e}")
-        import traceback
-        traceback.print_exc()
-        return None, None, None, None, None
-
 
 
 def plot_fitted_vs_actuals(model, forecast, y_full, test_size, log_transform=True, title="Fitted vs Actuals"):
@@ -1392,7 +900,7 @@ def plot_fitted_vs_actuals(model, forecast, y_full, test_size, log_transform=Tru
     return fig
 
 
-def plot_forecast(model, forecast, y_full, test_size, X_cols=None, date_dummies=None, log_transform=True, title="Prophet Forecast", future_periods=0, history_days=70, X_df=None):
+def plot_forecast(model, forecast, y_full, test_size, X_cols=None, date_dummies=None, log_transform=True, title="Prophet Forecast", future_periods=0, history_days=70):
     """
     Plot the complete forecast including historical data, test data, and future predictions.
     
@@ -1498,56 +1006,13 @@ def plot_forecast(model, forecast, y_full, test_size, X_cols=None, date_dummies=
                 dummy_cols = [col for col in X_cols if '_dummy' in col]
                 continuous_cols = [col for col in X_cols if col not in dummy_cols]
                 
-
-
-
-
-                # print(X_df[col])
-
-
-
-
-
-
-
-
-                # For continuous values, get actual values from original dataset if available
+                # For continuous values, use the most recent actual value and repeat it
                 for col in continuous_cols:
-                    # Check if column exists in the forecast
+                    # Get the last known value from the original forecast
                     if col in forecast.columns:
-                        # Get the original covariate data loaded at the beginning of the pipeline
-                        original_covariate = X_df[col] if isinstance(X_df, pd.DataFrame) and col in X_df else None
-                        print(col) ########################################
-                        print(X_df[col]) ########################################
-                        if original_covariate is not None:
-                            # Try to map future dates to actual values in the original dataset
-                            future_filled = False
-                            future_values = []
-                            
-                            for future_date in future_dates:
-                                if future_date in original_covariate.index:
-                                    # Use actual value from dataset for this date
-                                    future_values.append(original_covariate.loc[future_date])
-                                    future_filled = True
-                                else:
-                                    # If date not found, use last known value
-                                    print(f"No future data found in original dataset. Using last known value {X_df[col].iloc[-1]:.4f} for {col} on {future_date.date()}")
-                                    future_values.append(X_df[col].iloc[-1])
-                            
-                            if future_filled:
-                                # At least some dates were found in the original dataset
-                                print(f"Using actual values from original dataset for {col} where available")
-                                future[col] = future_values
-                            else:
-                                # No dates found, fall back to last known value
-                                last_value = forecast[col].iloc[-1]
-                                print(f"No future data found in original dataset. Using last known value {last_value:.4f} for {col}")
-                                future[col] = last_value
-                        else:
-                            # Original covariate not available, use last known value
-                            last_value = forecast[col].iloc[-1]
-                            print(f"Using last known value {last_value:.4f} for {col}")
-                            future[col] = last_value
+                        last_value = forecast[col].iloc[-1]
+                        print(f"Using last known value {last_value:.4f} for {col}")
+                        future[col] = last_value
                     else:
                         print(f"Warning: {col} not found in forecast. Using zero.")
                         future[col] = 0
@@ -1660,127 +1125,6 @@ def plot_components(model, forecast, log_transform=True):
     return fig
 
 
-def plot_variable_evaluation_enhanced(eval_results, y, X):
-    """
-    Enhanced visualization of covariate evaluation results.
-    
-    Parameters:
-    -----------
-    eval_results : dict
-        Results from evaluate_exogenous_variables function
-    y : pd.Series
-        Target variable
-    X : pd.DataFrame
-        DataFrame of exogenous variables
-    
-    Returns:
-    --------
-    matplotlib.figure.Figure
-        Figure containing the plots
-    """
-    
-    
-    # Create figure with grid layout
-    fig = plt.figure(figsize=(15, 12))
-    gs = GridSpec(3, 3, figure=fig)
-    
-    # Get variable names
-    variables = list(eval_results['correlation'].keys())
-    if not variables:
-        ax1 = fig.add_subplot(gs[0, 0])
-        ax1.text(0.5, 0.5, "No variables to evaluate", ha='center', va='center')
-        return fig
-    
-    # CRITICAL FIX: Align the series to ensure they cover the same date range
-    common_idx = y.index.intersection(X.index)
-    if len(common_idx) == 0:
-        ax1 = fig.add_subplot(gs[0, 0])
-        ax1.text(0.5, 0.5, "ERROR: No common dates found", ha='center', va='center')
-        return fig
-    
-    y_aligned = y.loc[common_idx]
-    X_aligned = X.loc[common_idx]
-    
-    print(f"Visualization: Using {len(common_idx)} aligned data points")# 3. Variable vs. Target scatter plot (top-right)
-    ax3 = fig.add_subplot(gs[0, 2])
-    
-    if variables:
-        var_name = variables[0]
-        # FIX: Use aligned data instead of original data
-        x_data = X_aligned[var_name].values
-        y_data = y_aligned.values
-        
-        # Plot scatter
-        ax3.scatter(x_data, y_data, alpha=0.6, edgecolors='w', linewidth=0.5)
-        
-        # Add trend line
-        try:
-            mask = ~np.isnan(x_data) & ~np.isnan(y_data)
-            if mask.sum() > 1:  # Need at least 2 points for regression
-                z = np.polyfit(x_data[mask], y_data[mask], 1)
-                p = np.poly1d(z)
-                x_range = np.linspace(min(x_data[mask]), max(x_data[mask]), 100)
-                ax3.plot(x_range, p(x_range), 'r--', linewidth=2)
-                
-                # Add R²
-                from scipy import stats
-                r_squared = stats.pearsonr(x_data[mask], y_data[mask])[0]**2
-                ax3.text(0.05, 0.95, f'R² = {r_squared:.3f}', transform=ax3.transAxes,
-                        va='top', ha='left', bbox=dict(facecolor='white', alpha=0.8))
-        except Exception as e:
-            print(f"Error fitting trend line: {e}")
-        
-        ax3.set_title(f'Target vs. {var_name}')
-        ax3.set_xlabel(var_name)
-        ax3.set_ylabel('Target')
-        ax3.grid(True, alpha=0.3)
-    
-    # 4. Time series plot of target and variable (bottom row)
-    ax4 = fig.add_subplot(gs[1:, :])
-    
-    if variables:
-        var_name = variables[0]
-        
-        # FIX: Use aligned data for time series plot too
-        ax4.plot(y_aligned.index, y_aligned, label='Target', color='steelblue', alpha=0.8)
-        
-        # Create twin y-axis for the exogenous variable
-        ax4_twin = ax4.twinx()
-        ax4_twin.plot(X_aligned.index, X_aligned[var_name], label=var_name, color='darkred', alpha=0.8)
-        
-        # Format dates on x-axis
-        import matplotlib.dates as mdates
-        ax4.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
-        ax4.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
-        plt.setp(ax4.xaxis.get_majorticklabels(), rotation=45)
-        
-        # Add labels
-        ax4.set_title(f'Time Series: Target and {var_name}')
-        ax4.set_xlabel('Date')
-        ax4.set_ylabel('Target', color='steelblue')
-        ax4_twin.set_ylabel(var_name, color='darkred')
-        
-        # Add legends
-        lines1, labels1 = ax4.get_legend_handles_labels()
-        lines2, labels2 = ax4_twin.get_legend_handles_labels()
-        ax4.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
-        
-        ax4.grid(True, alpha=0.3)
-    
-    # Add overall title with recommendations
-    if 'recommended_vars' in eval_results and eval_results['recommended_vars']:
-        rec = eval_results['recommended_vars'][0]
-        recommendation = (f"RECOMMENDATION: {rec['variable']} is recommended\n"
-                         f"Reason: {rec['reason']}")
-        fig.suptitle(recommendation, fontsize=16, y=0.99, 
-                    bbox=dict(facecolor='lightyellow', alpha=0.9, boxstyle='round'))
-    
-    plt.tight_layout()
-    plt.subplots_adjust(top=0.93)
-    
-    return fig
-
-
 def export_model_artifacts(results, output_dir='exports', include_plots=True):
     """
     Export Prophet model artifacts including model, forecast, and components.
@@ -1879,13 +1223,13 @@ def export_model_artifacts(results, output_dir='exports', include_plots=True):
             plt.close(fitted_vs_actuals_fig)
             print(f"Exported fitted vs actuals plot to: {fitted_vs_actuals_path}")
         
-        # # Export components plot using stored figure
-        # if 'components_fig' in results and results['components_fig'] is not None:
-        #     components_fig = results['components_fig']
-        #     components_plot_path = os.path.join(plots_dir, f'components_plot_{timestamp}.png')
-        #     components_fig.savefig(components_plot_path)
-        #     plt.close(components_fig)
-        #     print(f"Exported components plot to: {components_plot_path}")
+        # Export components plot using stored figure
+        if 'components_fig' in results and results['components_fig'] is not None:
+            components_fig = results['components_fig']
+            components_plot_path = os.path.join(plots_dir, f'components_plot_{timestamp}.png')
+            components_fig.savefig(components_plot_path)
+            plt.close(components_fig)
+            print(f"Exported components plot to: {components_plot_path}")
         
         # Export regressor importance plot using stored figure
         if 'reg_importance_fig' in results and results['reg_importance_fig'] is not None:
@@ -1895,27 +1239,16 @@ def export_model_artifacts(results, output_dir='exports', include_plots=True):
             plt.close(reg_imp_fig)
             print(f"Exported regressor importance plot to: {reg_imp_plot_path}")
     
-        # Export covariate evaluation plot if available
-        if 'covariate_eval_fig' in results and results['covariate_eval_fig'] is not None:
-            eval_fig = results['covariate_eval_fig']
-            eval_fig_path = os.path.join(plots_dir, f'covariate_evaluation_plot_{timestamp}.png')
-            eval_fig.savefig(eval_fig_path)
-            plt.close(eval_fig)
-            print(f"Exported covariate evaluation plot to: {eval_fig_path}")
-
-
     return {
         'model_path': model_path,
         'forecast_path': forecast_path,
-        'components_path': components_path,
-        'covariate_eval_path': eval_fig_path,
+        'components_path': components_path
     }
 
 
 def run_prophet_pipeline(
     target_path, 
     covariate_path=None, 
-    covariate_cols=None,
     test_size=35,
     future_periods=35,
     lags=[1, 7, 14], 
@@ -1923,9 +1256,7 @@ def run_prophet_pipeline(
     yearly_seasonality=True,
     weekly_seasonality=True,
     country_code=None,
-    date_dummies=None,
-    evaluate_covariates=True,
-    max_lag_for_evaluation=28
+    date_dummies=None
 ):
     """
     Run the complete Prophet forecasting pipeline.
@@ -1952,43 +1283,16 @@ def run_prophet_pipeline(
         Country code for holidays (e.g., 'US', 'BR', 'UK')
     date_dummies : list of dict, optional
         Custom date patterns to add as dummy variables
-    evaluate_covariates : bool, default=True
-        Whether to perform correlation and Granger causality tests on covariates
-    max_lag_for_evaluation : int, default=28
-        Maximum lag to consider for covariate evaluation
     """
     print("\n--- Starting Prophet Pipeline ---\n")
     
     # 1. Load data
     print("Loading data...")
-    y, X = load_data(target_path, covariate_path, covariate_cols=covariate_cols)
-
-    # Convert X to DataFrame if it's a Series
-    X_df = X.to_frame() if isinstance(X, pd.Series) else X
-
-    # Evaluate covariates if requested and if covariates exist
-    eval_results = None
-    eval_fig = None
-    if evaluate_covariates and X is not None:
-        print("\nEvaluating potential exogenous variables...")
-        
-        # Run evaluation
-        eval_results = evaluate_exogenous_variables(y, X_df, max_lag=max_lag_for_evaluation)
-
-        # Create enhanced visualization
-        eval_fig = plot_variable_evaluation_enhanced(eval_results, y, X_df)
-        
-        # Print recommendations
-        if eval_results['recommended_vars']:
-            print("\nRecommended variables based on statistical tests:")
-            for i, rec in enumerate(eval_results['recommended_vars']):
-                print(f"{i+1}. {rec['variable']} - {rec['reason']}")
-        else:
-            print("\nNo variables recommended based on statistical tests.")
+    y, X = load_data(target_path, covariate_path)
     
     # 2. Prepare data for Prophet
     print("\nPreparing data for Prophet...")
-    prophet_df, prophet_X_df = prepare_prophet_data(y, X, X_df, lags, log_transform, date_dummies)
+    prophet_df = prepare_prophet_data(y, X, lags, log_transform, date_dummies)
     
     # 3. Split data
     print("\nSplitting data into train and test sets...")
@@ -1997,6 +1301,7 @@ def run_prophet_pipeline(
     # 4. Determine regressor columns
     X_cols = None
     if X is not None:
+        X_base_name = X.name if X.name else 'covariate'
         # Get all columns except 'ds' and 'y'
         X_cols = [col for col in prophet_df.columns if col not in ['ds', 'y']]
     
@@ -2049,8 +1354,8 @@ def run_prophet_pipeline(
         title="Prophet Model Fit"
     )
 
-    # print("\nPlotting model components...")
-    # components_fig = plot_components(model, forecast, log_transform)
+    print("\nPlotting model components...")
+    components_fig = plot_components(model, forecast, log_transform)
 
     print("\nPlotting complete forecast with historical data...")
     forecast_fig, _ = plot_forecast(
@@ -2062,8 +1367,7 @@ def run_prophet_pipeline(
         date_dummies=date_dummies,  # Add this line to pass date_dummies parameter
         log_transform=log_transform,
         title=f"Prophet Complete Forecast (MAPE: {mape:.2f}%)",
-        future_periods=future_periods,
-        X_df = prophet_X_df
+        future_periods=future_periods
     )
 
     reg_importance_fig = None
@@ -2087,26 +1391,16 @@ def run_prophet_pipeline(
         'date_dummies': date_dummies,  
         'log_transform': log_transform,
         'fitted_vs_actuals_fig': fitted_vs_actuals_fig,
-        # 'components_fig': components_fig,
+        'components_fig': components_fig,
         'forecast_fig': forecast_fig,
-        'reg_importance_fig': reg_importance_fig,
-        'covariate_evaluation': eval_results,
-        'covariate_eval_fig': eval_fig
+        'reg_importance_fig': reg_importance_fig
     }
 
 
 # Example usage
 if __name__ == "__main__":
     TARGET_PATH = 'data/groupby_train.csv'
-    COVARIATE_PATH = 'data/groupby_transactions_2.csv'
-
-    # List all covariates to include
-    COVARIATE_COLS = [
-        'transactions',     
-        'is_weekend',      
-        # 'is_dayofweek_3',
-        # 'is_dayofweek_4',
-    ]
+    COVARIATE_PATH = 'data/groupby_transactions.csv'
 
     # Define dummy variables for specific dates
     date_dummies = [
@@ -2136,7 +1430,6 @@ if __name__ == "__main__":
     results = run_prophet_pipeline(
         target_path=TARGET_PATH,
         covariate_path=COVARIATE_PATH,
-        covariate_cols=COVARIATE_COLS,
         test_size=35,
         future_periods=35,
         lags=[1, 7, 14, 28],
@@ -2145,9 +1438,9 @@ if __name__ == "__main__":
         date_dummies=date_dummies
     )
 
-    # # Export model artifacts
-    # print("\nExporting model artifacts...")
-    # export_paths = export_model_artifacts(results)
-    # print("\nExport complete. Files saved to:")
-    # for key, path in export_paths.items():
-    #     print(f"- {key}: {path}")
+    # Export model artifacts
+    print("\nExporting model artifacts...")
+    export_paths = export_model_artifacts(results)
+    print("\nExport complete. Files saved to:")
+    for key, path in export_paths.items():
+        print(f"- {key}: {path}")
