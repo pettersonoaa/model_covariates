@@ -1478,4 +1478,4 @@ if __name__ == "__main__":
     # Optional: Access specific results if needed
     # model = pipeline_results.get('model')
     # mape = pipeline_results.get('mape')
-    # print(f"Final MAPE: {mape}")
+    # print(f"Final MAPE: {mape}") 
