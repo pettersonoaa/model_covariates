@@ -17,6 +17,7 @@ import matplotlib.dates as mdates
 from prophet import Prophet
 import pickle
 import os
+import re
 from datetime import datetime, timedelta
 from scipy import stats
 from statsmodels.stats.stattools import durbin_watson
@@ -183,47 +184,134 @@ def create_brazil_holiday_dummies_spec(start_date, end_date):
     holiday_specs = []
     years = range(start_date.year - 1, end_date.year + 2) # Buffer years
 
-    holiday_dates = {name: [] for name in [
-        'new_year', 'carnival', 'good_friday', 'tiradentes', 'labor_day',
-        'corpus_christi', 'independence_day', 'our_lady_aparecida',
-        'all_souls_day', 'republic_day', 'black_friday', 'christmas'
-    ]}
+    holiday_keys = [
+        # Natal window
+        'natal_pre5', 'natal_pre4', 'natal_pre3', 'natal_pre2', 'natal_pre1',
+        'natal_dia0', 'natal_pos1', 'natal_pos2', 'natal_pos3',
+        # Ano Novo window
+        'anonovo_pre3', 'anonovo_pre2', 'anonovo_pre1', 'anonovo_dia0',
+        'anonovo_pos1', 'anonovo_pos2', 'anonovo_pos3', 'anonovo_pos4',
+        'anonovo_pos5', 'anonovo_pos6',
+        # Fixed holidays
+        'tiradentes', 'diadotrab', 'independ', 'aparecida', 'finados', 'republica',
+        # Carnival window
+        'carnival_pre7', 'carnival_pre6', 'carnival_pre5', 'carnival_pre4',
+        'carnival_pre3', 'carnival_pre2', 'carnival_pre1', 'carnival_dia0',
+        'carnival_pos1', 'carnival_pos2', 'carnival_pos3', 'carnival_pos4',
+        'carnival_pos5', 'carnival_pos6', 'carnival_pos7',
+        # Easter-related
+        'sextasanta', 'corpuschristi',
+        # Black Friday window
+        'blackfriday_pre9', 'blackfriday_pre8', 'blackfriday_pre7', 'blackfriday_pre6',
+        'blackfriday_pre5', 'blackfriday_pre4', 'blackfriday_pre3', 'blackfriday_pre2',
+        'blackfriday_pre1', 'blackfriday_dia0', 'blackfriday_pos1', 'blackfriday_pos2',
+        'blackfriday_pos3', 'blackfriday_pos4', 'blackfriday_pos5', 'blackfriday_pos6',
+        'blackfriday_pos7', 'blackfriday_pos8', 'blackfriday_pos9'
+    ]
+
+    holiday_dates = {name: [] for name in holiday_keys}
 
     for year in years:
         # Fixed dates
-        holiday_dates['new_year'].append(f"{year}-01-01")
+        holiday_dates['natal_pre5'].append(f"{year}-12-20")
+        holiday_dates['natal_pre4'].append(f"{year}-12-21")
+        holiday_dates['natal_pre3'].append(f"{year}-12-22")
+        holiday_dates['natal_pre2'].append(f"{year}-12-23")
+        holiday_dates['natal_pre1'].append(f"{year}-12-24")
+        holiday_dates['natal_dia0'].append(f"{year}-12-25")
+        holiday_dates['natal_pos1'].append(f"{year}-12-26")
+        holiday_dates['natal_pos2'].append(f"{year}-12-27")
+        holiday_dates['natal_pos3'].append(f"{year}-12-28")
+        holiday_dates['anonovo_pre3'].append(f"{year}-12-29")
+        holiday_dates['anonovo_pre2'].append(f"{year}-12-30")
+        holiday_dates['anonovo_pre1'].append(f"{year}-12-31")
+        holiday_dates['anonovo_dia0'].append(f"{year}-01-01")
+        holiday_dates['anonovo_pos1'].append(f"{year}-01-02")
+        holiday_dates['anonovo_pos2'].append(f"{year}-01-03")
+        holiday_dates['anonovo_pos3'].append(f"{year}-01-04")
+        holiday_dates['anonovo_pos4'].append(f"{year}-01-05")
+        holiday_dates['anonovo_pos5'].append(f"{year}-01-06")
+        holiday_dates['anonovo_pos6'].append(f"{year}-01-07")
         holiday_dates['tiradentes'].append(f"{year}-04-21")
-        holiday_dates['labor_day'].append(f"{year}-05-01")
-        holiday_dates['independence_day'].append(f"{year}-09-07")
-        holiday_dates['our_lady_aparecida'].append(f"{year}-10-12")
-        holiday_dates['all_souls_day'].append(f"{year}-11-02")
-        holiday_dates['republic_day'].append(f"{year}-11-15")
-        holiday_dates['christmas'].append(f"{year}-12-25")
+        holiday_dates['diadotrab'].append(f"{year}-05-01")
+        holiday_dates['independ'].append(f"{year}-09-07")
+        holiday_dates['aparecida'].append(f"{year}-10-12")
+        holiday_dates['finados'].append(f"{year}-11-02")
+        holiday_dates['republica'].append(f"{year}-11-15")
 
         # Easter-based
         try:
             easter_date = easter(year)
-            holiday_dates['carnival'].append((easter_date - timedelta(days=47)).strftime("%Y-%m-%d"))
-            holiday_dates['good_friday'].append((easter_date - timedelta(days=2)).strftime("%Y-%m-%d"))
-            holiday_dates['corpus_christi'].append((easter_date + timedelta(days=60)).strftime("%Y-%m-%d"))
+            holiday_dates['carnival_pre7'].append((easter_date - timedelta(days=54)).strftime("%Y-%m-%d"))
+            holiday_dates['carnival_pre6'].append((easter_date - timedelta(days=53)).strftime("%Y-%m-%d"))
+            holiday_dates['carnival_pre5'].append((easter_date - timedelta(days=52)).strftime("%Y-%m-%d"))
+            holiday_dates['carnival_pre4'].append((easter_date - timedelta(days=51)).strftime("%Y-%m-%d"))
+            holiday_dates['carnival_pre3'].append((easter_date - timedelta(days=50)).strftime("%Y-%m-%d"))
+            holiday_dates['carnival_pre2'].append((easter_date - timedelta(days=49)).strftime("%Y-%m-%d"))
+            holiday_dates['carnival_pre1'].append((easter_date - timedelta(days=48)).strftime("%Y-%m-%d"))
+            holiday_dates['carnival_dia0'].append((easter_date - timedelta(days=47)).strftime("%Y-%m-%d"))
+            holiday_dates['carnival_pos1'].append((easter_date - timedelta(days=46)).strftime("%Y-%m-%d"))
+            holiday_dates['carnival_pos2'].append((easter_date - timedelta(days=45)).strftime("%Y-%m-%d"))
+            holiday_dates['carnival_pos3'].append((easter_date - timedelta(days=44)).strftime("%Y-%m-%d"))
+            holiday_dates['carnival_pos4'].append((easter_date - timedelta(days=43)).strftime("%Y-%m-%d"))
+            holiday_dates['carnival_pos5'].append((easter_date - timedelta(days=42)).strftime("%Y-%m-%d"))
+            holiday_dates['carnival_pos6'].append((easter_date - timedelta(days=41)).strftime("%Y-%m-%d"))
+            holiday_dates['carnival_pos7'].append((easter_date - timedelta(days=40)).strftime("%Y-%m-%d"))
+            holiday_dates['sextasanta'].append((easter_date - timedelta(days=2)).strftime("%Y-%m-%d"))
+            holiday_dates['corpuschristi'].append((easter_date + timedelta(days=60)).strftime("%Y-%m-%d"))
         except Exception as e:
             print(f"  WARNING: Error calculating Easter holidays for {year}: {e}")
 
         # Black Friday (4th Friday in Nov)
-        thanksgiving = pd.Timestamp(f'{year}-11-01')
-        while thanksgiving.dayofweek != 3: thanksgiving += timedelta(days=1)
-        thanksgiving += timedelta(days=21) # 4th Thursday
-        holiday_dates['black_friday'].append((thanksgiving + timedelta(days=1)).strftime("%Y-%m-%d"))
+        try: # Add try-except for robustness
+            thanksgiving = pd.Timestamp(f'{year}-11-01')
+            # Find the first Thursday
+            while thanksgiving.dayofweek != 3: thanksgiving += timedelta(days=1)
+            # Move to the fourth Thursday
+            thanksgiving += timedelta(days=21)
+            holiday_dates['blackfriday_pre9'].append((thanksgiving + timedelta(days=-8)).strftime("%Y-%m-%d"))
+            holiday_dates['blackfriday_pre8'].append((thanksgiving + timedelta(days=-7)).strftime("%Y-%m-%d"))
+            holiday_dates['blackfriday_pre7'].append((thanksgiving + timedelta(days=-6)).strftime("%Y-%m-%d"))
+            holiday_dates['blackfriday_pre6'].append((thanksgiving + timedelta(days=-5)).strftime("%Y-%m-%d"))
+            holiday_dates['blackfriday_pre5'].append((thanksgiving + timedelta(days=-4)).strftime("%Y-%m-%d"))
+            holiday_dates['blackfriday_pre4'].append((thanksgiving + timedelta(days=-3)).strftime("%Y-%m-%d"))
+            holiday_dates['blackfriday_pre3'].append((thanksgiving + timedelta(days=-2)).strftime("%Y-%m-%d"))
+            holiday_dates['blackfriday_pre2'].append((thanksgiving + timedelta(days=-1)).strftime("%Y-%m-%d"))
+            holiday_dates['blackfriday_pre1'].append((thanksgiving + timedelta(days=0)).strftime("%Y-%m-%d"))
+            holiday_dates['blackfriday_dia0'].append((thanksgiving + timedelta(days=1)).strftime("%Y-%m-%d"))
+            holiday_dates['blackfriday_pos1'].append((thanksgiving + timedelta(days=2)).strftime("%Y-%m-%d"))
+            holiday_dates['blackfriday_pos2'].append((thanksgiving + timedelta(days=3)).strftime("%Y-%m-%d"))
+            holiday_dates['blackfriday_pos3'].append((thanksgiving + timedelta(days=4)).strftime("%Y-%m-%d"))
+            holiday_dates['blackfriday_pos4'].append((thanksgiving + timedelta(days=5)).strftime("%Y-%m-%d"))
+            holiday_dates['blackfriday_pos5'].append((thanksgiving + timedelta(days=6)).strftime("%Y-%m-%d"))
+            holiday_dates['blackfriday_pos6'].append((thanksgiving + timedelta(days=7)).strftime("%Y-%m-%d"))
+            holiday_dates['blackfriday_pos7'].append((thanksgiving + timedelta(days=8)).strftime("%Y-%m-%d"))
+            holiday_dates['blackfriday_pos8'].append((thanksgiving + timedelta(days=9)).strftime("%Y-%m-%d"))
+            holiday_dates['blackfriday_pos9'].append((thanksgiving + timedelta(days=10)).strftime("%Y-%m-%d"))
+        except Exception as e:
+             print(f"  WARNING: Error calculating Black Friday for {year}: {e}")
 
     # Define windows and create specs
     for name, dates in holiday_dates.items():
         dummy_name = f"{name}_dummy"
-        if name in ['carnival', 'christmas', 'new_year', 'black_friday']:
-            window_before, window_after = 3, 2
-        elif name in ['good_friday', 'labor_day']:
-            window_before, window_after = 1, 1
+        # --- FIX: Simplified window logic based on name patterns ---
+        window_before, window_after = 0, 0
+        if '_pre_nivel_' in name:
+            try:
+                num = int(name.split('_pre_nivel_')[-1])
+                window_before = num
+            except ValueError: pass # Keep 0 if parsing fails
+        elif '_pos_nivel_' in name:
+            try:
+                num = int(name.split('_pos_nivel_')[-1])
+                window_after = num
+            except ValueError: pass # Keep 0 if parsing fails
+        elif name in ['carnival', 'natal', 'anonovo', 'blackfriday']: # Base names (if used)
+             window_before, window_after = 3, 2 # Default window for broader events
+        elif name in ['sextasanta', 'diadotrab']:
+             window_before, window_after = 1, 1
         else:
-            window_before, window_after = 1, 0
+            window_before, window_after = 0, 0
 
         holiday_specs.append({
             'name': dummy_name,
