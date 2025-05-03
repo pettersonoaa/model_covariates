@@ -700,7 +700,7 @@ def plot_regressor_importance(importance, top_n=None, show=True):
     
     # Create bar chart
     fig = plt.figure(figsize=(12, 6))
-    bars = plt.barh(regressors, values, color='skyblue')
+    bars = plt.barh(regressors, values, color='slategrey')
     
     # Add labels and formatting
     plt.xlabel('Absolute Mean Contribution')
@@ -1479,10 +1479,10 @@ def plot_forecast(model, forecast, y_full, test_size, X_cols=None, date_dummies=
     
     # Plot test data
     # ax.plot(test_dates, test_values, 'b-', label='Test Actuals')
-    ax.plot(test_dates, test_values, color='tab:blue', linewidth=2, label='Test Actuals')
+    ax.plot(test_dates, test_values, color='slategray', linewidth=2, label='Test Actuals')
     
     # Plot predictions over the entire range
-    ax.plot(forecast_dates, yhat, color='tab:red', linewidth=2,  label='Predicted') # linestyle='dashed',
+    ax.plot(forecast_dates, yhat, color='tab:red', linewidth=2, alpha=0.7, label='Predicted') # linestyle='dashed',
     
     # Plot confidence intervals
     # ax.fill_between(forecast_dates, yhat_lower, yhat_upper, color='orange', alpha=0.2, label='95% Confidence Interval')
@@ -1500,8 +1500,8 @@ def plot_forecast(model, forecast, y_full, test_size, X_cols=None, date_dummies=
             ax.fill_between(future_dates, future_yhat_lower, future_yhat_upper, color='tab:orange', alpha=0.1)
     
     # Add vertical line to separate train and test data
-    ax.axvline(x=train_dates[-1], color='tab:blue', linewidth=1, linestyle='--')
-    ax.axvline(x=test_dates[-1], color='tab:blue', linewidth=1, linestyle='--')
+    ax.axvline(x=train_dates[-1], color='slategray', linewidth=1, linestyle='--')
+    ax.axvline(x=test_dates[-1], color='slategray', linewidth=1, linestyle='--')
 
     # Set x-axis limits to show only the desired history period
     if len(history_dates) > 0:
@@ -1604,12 +1604,12 @@ def plot_variable_evaluation_enhanced(eval_results, y, X):
             
             if lags:
                 # Plot p-values for each lag
-                bar_colors = ['tab:green' if sig else 'tab:red' for sig in significant]
+                bar_colors = ['slategrey' if sig else 'tab:red' for sig in significant]
                 ax_granger.bar(lags, pvals, color=bar_colors, alpha=0.7)
                 
                 # Add significance threshold line
                 alpha = 0.05  # Common significance threshold
-                ax_granger.axhline(y=alpha, color='black', linestyle='--', alpha=0.7)
+                ax_granger.axhline(y=alpha, color='black', linestyle='--', alpha=0.5)
                 ax_granger.text(max(lags), alpha, f'p={alpha} threshold', va='bottom', ha='right', 
                         bbox=dict(facecolor='white', alpha=0.8))
                 
@@ -1621,13 +1621,13 @@ def plot_variable_evaluation_enhanced(eval_results, y, X):
                 if best_lag is not None:
                     best_idx = lags.index(best_lag)
                     # Highlight the best lag
-                    ax_granger.bar([best_lag], [pvals[best_idx]], color='tab:blue', alpha=1.0)
+                    ax_granger.bar([best_lag], [pvals[best_idx]], color='tab:orange', alpha=1.0)
                     ax_granger.annotate(f"Best lag: {best_lag}\np={pvals[best_idx]:.4f}", 
                                 xy=(best_lag, pvals[best_idx]), 
                                 xytext=(best_lag, pvals[best_idx] + 0.1),
                                 arrowprops=dict(facecolor='black', shrink=0.05, width=1.5),
                                 ha='center', va='bottom',
-                                bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="b"))
+                                bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="k"))
                     
                     # Add visual indicator for Granger causality at this lag
                     ax_granger.text(0.02, 0.02, 
@@ -1661,7 +1661,7 @@ def plot_variable_evaluation_enhanced(eval_results, y, X):
         target_data = y_aligned.values
         
         # Plot scatter
-        ax_scatter.scatter(var_data, target_data, alpha=0.6, edgecolors='w', linewidth=0.5)
+        ax_scatter.scatter(var_data, target_data, alpha=0.5, color='slategrey', edgecolors='w', linewidth=0.5)
         
         # Add trend line
         try:
@@ -1670,7 +1670,7 @@ def plot_variable_evaluation_enhanced(eval_results, y, X):
                 z = np.polyfit(var_data[mask], target_data[mask], 1)
                 p = np.poly1d(z)
                 x_range = np.linspace(min(var_data[mask]), max(var_data[mask]), 100)
-                ax_scatter.plot(x_range, p(x_range), 'r--', linewidth=2)
+                ax_scatter.plot(x_range, p(x_range), color='tab:orange', linewidth=2.5, alpha=0.7)
                 
                 # Add R²
                 from scipy import stats
@@ -1697,9 +1697,9 @@ def plot_variable_evaluation_enhanced(eval_results, y, X):
         monthly_covar = covar_series.resample('ME').mean()
         
         # Plot monthly target data on left y-axis
-        color1 = 'steelblue'
+        color1 = 'slategrey'
         ax_monthly.plot(monthly_target.index, monthly_target.values, 
-                      color=color1, linewidth=2, marker='o', markersize=4,
+                      color=color1, linewidth=2, 
                       label='Target')
         ax_monthly.set_ylabel('Target Value', color=color1)
         ax_monthly.tick_params(axis='y', labelcolor=color1)
@@ -1708,9 +1708,9 @@ def plot_variable_evaluation_enhanced(eval_results, y, X):
         ax_monthly_twin = ax_monthly.twinx()
         
         # Plot monthly covariate data on right y-axis
-        color2 = 'darkred'
+        color2 = 'tab:red'
         ax_monthly_twin.plot(monthly_covar.index, monthly_covar.values, 
-                           color=color2, linewidth=2, marker='s', markersize=4,
+                           color=color2, linewidth=2, alpha=0.7,
                            label=var_name)
         ax_monthly_twin.set_ylabel(f'{var_name} Value', color=color2)
         ax_monthly_twin.tick_params(axis='y', labelcolor=color2)
@@ -1732,7 +1732,7 @@ def plot_variable_evaluation_enhanced(eval_results, y, X):
         # Format x-axis dates
         import matplotlib.dates as mdates
         ax_monthly.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
-        ax_monthly.xaxis.set_major_locator(mdates.MonthLocator(interval=3))  # Every 3 months
+        ax_monthly.xaxis.set_major_locator(mdates.MonthLocator(interval=6))  # Every 6 months
         plt.setp(ax_monthly.xaxis.get_majorticklabels(), rotation=45)
         
         # Add grid
@@ -1746,14 +1746,14 @@ def plot_variable_evaluation_enhanced(eval_results, y, X):
         
         ax_monthly.set_title(f'Monthly {var_name} vs. Target')
         
-        # Add recommendation banners if available
-        for rec in eval_results.get('recommended_vars', []):
-            if rec['variable'] == var_name:
-                recommendation = f"RECOMMENDATION: {var_name} is recommended\nReason: {rec['reason']}"
-                fig.text(0.5, 0.98 - (var_idx/len(variables)), recommendation,
-                         ha='center', va='top', fontsize=12,
-                         bbox=dict(facecolor='lightyellow', alpha=0.9, boxstyle='round'))
-                break
+        # # Add recommendation banners if available
+        # for rec in eval_results.get('recommended_vars', []):
+        #     if rec['variable'] == var_name:
+        #         recommendation = f"RECOMMENDATION: {var_name} is recommended\nReason: {rec['reason']}"
+        #         fig.text(0.5, 0.98 - (var_idx/len(variables)), recommendation,
+        #                  ha='center', va='top', fontsize=12,
+        #                  bbox=dict(facecolor='lightyellow', alpha=0.9, boxstyle='round'))
+        #         break
     
     # Add overall title
     fig.suptitle("Variable Evaluation Analysis", fontsize=16, y=0.99)
