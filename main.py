@@ -111,17 +111,336 @@ def get_country_holidays(country_code, start_date, end_date, pre_post_days=1):
     for date, name in country_holidays_dict.items():
         # Add the main holiday
         holiday_list.append({
-            'holiday': f"{name}",
             'ds': pd.Timestamp(date),
+            'holiday': f"{name}",
             'lower_window': -pre_post_days,
-            'upper_window': pre_post_days
+            'upper_window': pre_post_days,
+            'prior_scale': 20.0  # Increase effect size for individual holidays
         })
     
     # Convert to DataFrame
     holidays_df = pd.DataFrame(holiday_list)
+
+    # Add additional Brazilian specific holidays with stronger effects
+    if country_code.upper() == 'BR':
+        # Add extra emphasis to major Brazilian holidays
+        carnival_holidays = []
+        for year in range(start_date.year-1, end_date.year+2):
+            # Carnival - extremely important in Brazil
+            carnival_date = calculate_carnival_date(year)
+            if carnival_date:
+                carnival_holidays.append({
+                    'ds': carnival_date,
+                    'holiday': 'Carnival',
+                    'lower_window': -2,  # Effects start earlier
+                    'upper_window': 2,   # Effects last longer
+                    'prior_scale': 30.0  # Much stronger effect
+                })
+        
+        # If we found any carnival dates, add them using concat
+        if carnival_holidays:
+            carnival_df = pd.DataFrame(carnival_holidays)
+            holidays_df = pd.concat([holidays_df, carnival_df], ignore_index=True)
     
     print(f"Generated {len(holidays_df)} holiday features for {country_code} between {start_date.date()} and {end_date.date()}")
     return holidays_df
+
+
+def create_enhanced_holidays(country_code, start_date, end_date):
+    """
+    Create enhanced holiday features with stronger prior scales.
+    
+    Parameters:
+    -----------
+    country_code : str
+        Country code (e.g., 'BR', 'US')
+    start_date : datetime or Timestamp
+        Start date for holiday range
+    end_date : datetime or Timestamp
+        End date for holiday range
+        
+    Returns:
+    --------
+    pd.DataFrame
+        Holiday DataFrame ready for Prophet with enhanced effects
+    """
+    # Ensure dates are pandas Timestamps
+    start_date = pd.to_datetime(start_date)
+    end_date = pd.to_datetime(end_date)
+    
+    # Initialize empty DataFrame for holidays
+    holidays_list = []
+    
+    if country_code and country_code.upper() == 'BR':
+        # Create manually defined Brazilian holidays with high prior scales
+        years = range(start_date.year - 1, end_date.year + 2)
+        
+        # Add key Brazilian holidays for each year
+        for year in years:
+            # New Year's Day
+            holidays_list.append({
+                'holiday': 'New_Year',
+                'ds': pd.Timestamp(f'{year}-01-01'),
+                'lower_window': -1,
+                'upper_window': 1,
+                'prior_scale': 50.0
+            })
+            
+            # Carnival (calculate based on Easter)
+            from dateutil.easter import easter
+            easter_date = easter(year)
+            carnival_date = easter_date - pd.Timedelta(days=47)
+            
+            holidays_list.append({
+                'holiday': 'Carnival',
+                'ds': carnival_date,
+                'lower_window': -2,
+                'upper_window': 2,
+                'prior_scale': 100.0  # Very high prior scale for Carnival
+            })
+            
+            # Good Friday
+            good_friday = easter_date - pd.Timedelta(days=2)
+            holidays_list.append({
+                'holiday': 'Good_Friday',
+                'ds': good_friday,
+                'lower_window': -1,
+                'upper_window': 1,
+                'prior_scale': 50.0
+            })
+            
+            # Tiradentes Day
+            holidays_list.append({
+                'holiday': 'Tiradentes_Day',
+                'ds': pd.Timestamp(f'{year}-04-21'),
+                'lower_window': 0,
+                'upper_window': 0,
+                'prior_scale': 30.0
+            })
+            
+            # Labor Day
+            holidays_list.append({
+                'holiday': 'Labor_Day',
+                'ds': pd.Timestamp(f'{year}-05-01'),
+                'lower_window': -1,
+                'upper_window': 1,
+                'prior_scale': 40.0
+            })
+            
+            # Independence Day
+            holidays_list.append({
+                'holiday': 'Independence_Day',
+                'ds': pd.Timestamp(f'{year}-09-07'),
+                'lower_window': -1,
+                'upper_window': 1,
+                'prior_scale': 40.0
+            })
+            
+            # Our Lady of Aparecida
+            holidays_list.append({
+                'holiday': 'Our_Lady_Aparecida',
+                'ds': pd.Timestamp(f'{year}-10-12'),
+                'lower_window': -1,
+                'upper_window': 1,
+                'prior_scale': 40.0
+            })
+            
+            # All Souls' Day
+            holidays_list.append({
+                'holiday': 'All_Souls_Day',
+                'ds': pd.Timestamp(f'{year}-11-02'),
+                'lower_window': -1,
+                'upper_window': 1,
+                'prior_scale': 40.0
+            })
+            
+            # Republic Proclamation Day
+            holidays_list.append({
+                'holiday': 'Republic_Day',
+                'ds': pd.Timestamp(f'{year}-11-15'),
+                'lower_window': -1,
+                'upper_window': 1,
+                'prior_scale': 40.0
+            })
+
+            # Black Friday - add as the 4th Friday of November
+            # Calculate the date of the 4th Thursday of November
+            thanksgiving = pd.Timestamp(f'{year}-11-01')
+            while thanksgiving.dayofweek != 3:  # 3 = Thursday (Mon=0, Sun=6)
+                thanksgiving += pd.Timedelta(days=1)
+            # Find the 4th Thursday
+            thanksgiving += pd.Timedelta(days=7 * 3)
+            # Black Friday is the day after
+            black_friday = thanksgiving + pd.Timedelta(days=1)
+            
+            holidays_list.append({
+                'holiday': 'Black_Friday',
+                'ds': black_friday,
+                'lower_window': -3,  # Effect starts a few days before (pre-sales)
+                'upper_window': 3,   # Effect continues for a few days after
+                'prior_scale': 90.0  # Very high impact for sales data
+            })
+            
+            # Christmas
+            holidays_list.append({
+                'holiday': 'Christmas',
+                'ds': pd.Timestamp(f'{year}-12-25'),
+                'lower_window': -3,
+                'upper_window': 1,
+                'prior_scale': 80.0
+            })
+    else:
+        # For non-BR countries, use the holidays package with enhanced prior scales
+        try:
+            country_holidays_dict = holidays.country_holidays(
+                country_code, 
+                years=range(start_date.year-1, end_date.year+2)
+            )
+            
+            for date, name in country_holidays_dict.items():
+                holidays_list.append({
+                    'holiday': f"{name}",
+                    'ds': pd.Timestamp(date),
+                    'lower_window': -1,
+                    'upper_window': 1,
+                    'prior_scale': 30.0  # Higher default prior scale
+                })
+        except Exception as e:
+            print(f"Error getting holidays for {country_code}: {e}")
+    
+    # Convert to DataFrame
+    if holidays_list:
+        holidays_df = pd.DataFrame(holidays_list)
+    else:
+        # Return empty DataFrame with the right columns if no holidays
+        holidays_df = pd.DataFrame(columns=['holiday', 'ds', 'lower_window', 'upper_window', 'prior_scale'])
+    
+    print(f"Created {len(holidays_df)} holidays for {country_code} with enhanced effects")
+    
+    return holidays_df
+
+
+def calculate_carnival_date(year):
+    """Calculate the date of Carnival (47 days before Easter)"""
+    try:
+        from dateutil.easter import easter
+        easter_date = easter(year)
+        carnival_date = easter_date - pd.Timedelta(days=47)
+        return carnival_date
+    except:
+        return None
+
+
+def create_brazil_holiday_dummies(start_date, end_date):
+    """
+    Create dummy variable specifications for Brazilian holidays.
+    
+    Parameters:
+    -----------
+    start_date : datetime or string
+        Start date for the holiday range
+    end_date : datetime or string
+        End date for the holiday range
+    
+    Returns:
+    --------
+    list of dict
+        List of holiday dummy specifications ready for add_date_dummies function
+    """
+    # Convert to pandas datetime if needed
+    start_date = pd.to_datetime(start_date)
+    end_date = pd.to_datetime(end_date)
+    
+    # Initialize empty list for holiday dummy specifications
+    holiday_dummies = []
+    
+    # Get all years in the date range plus buffer years
+    years = range(start_date.year - 1, end_date.year + 2)
+    
+    # List to collect all specific holiday dates
+    holiday_dates = {
+        'new_year_dummy': [],
+        'carnival_dummy': [],
+        'good_friday_dummy': [],
+        'tiradentes_dummy': [],
+        'labor_day_dummy': [],
+        'corpus_christi_dummy': [],
+        'independence_day_dummy': [],
+        'our_lady_aparecida_dummy': [],
+        'all_souls_day_dummy': [],
+        'republic_day_dummy': [],
+        'black_friday_dummy': [],
+        'christmas_dummy': []
+    }
+    
+    # Calculate holidays for each year
+    for year in years:
+        # Fixed date holidays
+        holiday_dates['new_year_dummy'].append(f"{year}-01-01")  # New Year's Day
+        holiday_dates['tiradentes_dummy'].append(f"{year}-04-21")  # Tiradentes Day
+        holiday_dates['labor_day_dummy'].append(f"{year}-05-01")  # Labor Day
+        holiday_dates['independence_day_dummy'].append(f"{year}-09-07")  # Independence Day
+        holiday_dates['our_lady_aparecida_dummy'].append(f"{year}-10-12")  # Our Lady Aparecida
+        holiday_dates['all_souls_day_dummy'].append(f"{year}-11-02")  # All Souls' Day
+        holiday_dates['republic_day_dummy'].append(f"{year}-11-15")  # Republic Day
+        holiday_dates['christmas_dummy'].append(f"{year}-12-25")  # Christmas
+        
+        # Easter-based holidays
+        try:
+            from dateutil.easter import easter
+            easter_date = easter(year)
+            
+            # Carnival (47 days before Easter)
+            carnival_date = easter_date - pd.Timedelta(days=47)
+            holiday_dates['carnival_dummy'].append(carnival_date.strftime("%Y-%m-%d"))
+            
+            # Good Friday (2 days before Easter)
+            good_friday = easter_date - pd.Timedelta(days=2)
+            holiday_dates['good_friday_dummy'].append(good_friday.strftime("%Y-%m-%d"))
+            
+            # Corpus Christi (60 days after Easter)
+            corpus_christi = easter_date + pd.Timedelta(days=60)
+            holiday_dates['corpus_christi_dummy'].append(corpus_christi.strftime("%Y-%m-%d"))
+        except Exception as e:
+            print(f"Error calculating Easter-based holidays for {year}: {e}")
+        
+        # Black Friday (4th Friday of November)
+        thanksgiving = pd.Timestamp(f'{year}-11-01')
+        while thanksgiving.dayofweek != 3:  # 3 = Thursday
+            thanksgiving += pd.Timedelta(days=1)
+        # Find the 4th Thursday
+        thanksgiving += pd.Timedelta(days=7 * 3)
+        # Black Friday is the day after
+        black_friday = thanksgiving + pd.Timedelta(days=1)
+        holiday_dates['black_friday_dummy'].append(black_friday.strftime("%Y-%m-%d"))
+    
+    # Create dummy specifications for each holiday with appropriate windows
+    for holiday_name, dates in holiday_dates.items():
+        # Customize window based on holiday importance
+        if holiday_name in ['carnival_dummy', 'christmas_dummy', 'new_year_dummy', 'black_friday_dummy']:
+            # Major holidays with extended effects
+            window_before = 3
+            window_after = 2
+        elif holiday_name in ['good_friday_dummy', 'labor_day_dummy']:
+            # Medium holidays
+            window_before = 1
+            window_after = 1
+        else:
+            # Standard holidays
+            window_before = 1
+            window_after = 0
+        
+        # Create the dummy specification
+        holiday_dummies.append({
+            'name': holiday_name,
+            'specific_dates': dates,
+            'window_before': window_before,
+            'window_after': window_after
+        })
+    
+    print(f"Created {len(holiday_dummies)} holiday dummy specifications covering {len(years)} years")
+    return holiday_dummies
+
 
 def add_date_dummies(df, date_patterns):
     """
@@ -347,8 +666,8 @@ def split_data(df, test_size=30):
 
 
 def train_prophet_model(train_df, X_cols=None, yearly_seasonality=True, weekly_seasonality=True, 
-                        daily_seasonality=False, country_code=None):
-    """Train a Prophet model with optional regressors and holidays."""
+                       daily_seasonality=False, country_code=None):
+    """Train a Prophet model with optional regressors and enhanced holidays."""
     # Initialize model
     model_kwargs = {
         'yearly_seasonality': yearly_seasonality,
@@ -362,17 +681,39 @@ def train_prophet_model(train_df, X_cols=None, yearly_seasonality=True, weekly_s
         min_date = pd.to_datetime(train_df['ds'].min())
         max_date = pd.to_datetime(train_df['ds'].max())
         
-        # Generate holiday DataFrame
-        holidays_df = get_country_holidays(
-            country_code=country_code, 
-            start_date=min_date - timedelta(days=365),  # Include previous year
-            end_date=max_date + timedelta(days=365)     # Include next year
+        # Use the new function to create enhanced holidays
+        holidays_df = create_enhanced_holidays(
+            country_code=country_code,
+            start_date=min_date - timedelta(days=365),
+            end_date=max_date + timedelta(days=365)
         )
         
         # Add holidays to model
         model_kwargs['holidays'] = holidays_df
-        print(f"Added {len(holidays_df)} holidays from {country_code} to the model")
-    
+        model_kwargs['holidays_prior_scale'] = 50.0  # Global scale for all holidays
+        print(f"Added {len(holidays_df)} enhanced holidays from {country_code}")
+        
+        # Print holidays in training period for debugging
+        if len(holidays_df) > 0:
+            holidays_df['ds'] = pd.to_datetime(holidays_df['ds'])
+            
+            in_range_holidays = holidays_df[
+                (holidays_df['ds'] >= min_date) & 
+                (holidays_df['ds'] <= max_date)
+            ]
+            
+            if len(in_range_holidays) == 0:
+                print("  WARNING: No holidays found within the training date range!")
+            else:
+                print(f"  Found {len(in_range_holidays)} holidays in training range")
+                for _, row in in_range_holidays.head(10).iterrows():
+                    holiday_date = row['ds'].strftime('%Y-%m-%d')
+                    holiday_name = row['holiday']
+                    prior_scale = row.get('prior_scale', model_kwargs['holidays_prior_scale'])
+                    print(f"  • {holiday_date}: {holiday_name} (prior_scale={prior_scale})")
+                if len(in_range_holidays) > 10:
+                    print(f"  • ... and {len(in_range_holidays) - 10} more holidays")
+
     # Create model with compiled parameters
     model = Prophet(**model_kwargs)
     
@@ -387,6 +728,8 @@ def train_prophet_model(train_df, X_cols=None, yearly_seasonality=True, weekly_s
     print("Model fitted successfully")
     
     return model
+
+
 
 
 def make_predictions(model, periods, train_df, test_df=None, X_cols=None):
@@ -1086,7 +1429,7 @@ def plot_fitted_vs_actuals(model, forecast, y_full, test_size, log_transform=Tru
         
         stats_text = f"R²: {r_squared:.4f}\nMAPE: {mape:.2f}%" if not np.isnan(mape) else f"R²: {r_squared:.4f}"
         ax1.text(0.05, 0.95, stats_text, 
-                transform=ax1.transAxes, fontsize=12, verticalalignment='top',
+                transform=ax1.transAxes, fontsize=8, verticalalignment='top',
                 bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
     except Exception as e:
         print(f"ERROR calculating statistics: {e}")
@@ -1099,7 +1442,7 @@ def plot_fitted_vs_actuals(model, forecast, y_full, test_size, log_transform=Tru
     ax1.set_ylabel('Fitted Values')
     ax1.set_title(f"{title} (Correlation)")
     ax1.grid(True, alpha=0.3)
-    ax1.legend()
+    ax1.legend(fontsize=8)
 
 
     # NEW SUBPLOT 4: Residuals histogram
@@ -1185,7 +1528,7 @@ def plot_fitted_vs_actuals(model, forecast, y_full, test_size, log_transform=Tru
     seasonal_df['week_of_year'] = [d.isocalendar()[1] for d in matched_dates]
     
     # Choose what to display - day of week seasonality
-    day_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+    day_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
 
     # Calculate overall average of actual values
     overall_mean_actual = np.mean(actuals)
@@ -1221,20 +1564,6 @@ def plot_fitted_vs_actuals(model, forecast, y_full, test_size, log_transform=Tru
 
     # Format y-axis as percentage
     ax5.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{x:.1f}'))
-    
-    # # Add annotations showing percentage difference from average
-    # for i, val in enumerate(dow_grouped['actual', 'normalized_mean']):
-    #     percentage = (val - 1.0) * 100
-    #     color = 'green' if percentage >= 0 else 'red'
-    #     ax5.annotate(f"{percentage:+.1f}%", 
-    #                 (i, val), 
-    #                 xytext=(0, 10 if percentage >= 0 else -15),
-    #                 textcoords="offset points",
-    #                 ha='center',
-    #                 va='center',
-    #                 color=color,
-    #                 fontweight='bold',
-    #                 fontsize=8)
 
     # Add labels and title
     ax5.set_xlabel('Day of Week')
@@ -1277,20 +1606,6 @@ def plot_fitted_vs_actuals(model, forecast, y_full, test_size, log_transform=Tru
 
     # Format y-axis as percentage
     ax6.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{x:.1f}'))
-
-    # # Add annotations showing percentage difference from average
-    # for i, val in enumerate(normalized_means):
-    #     percentage = (val - 1.0) * 100
-    #     color = 'green' if percentage >= 0 else 'red'
-    #     ax6.annotate(f"{percentage:+.1f}%", 
-    #                 (valid_months[i], val), 
-    #                 xytext=(0, 10 if percentage >= 0 else -15),
-    #                 textcoords="offset points",
-    #                 ha='center',
-    #                 va='center',
-    #                 color=color,
-    #                 fontweight='bold',
-    #                 fontsize=8)
     
     # Set x-axis labels to month names for valid months
     ax6.set_xticks(valid_months)
@@ -1357,7 +1672,7 @@ def plot_fitted_vs_actuals(model, forecast, y_full, test_size, log_transform=Tru
     ax2.set_ylabel('Value')
     ax2.set_title(f"{title} (Daily Time Series)")
     ax2.grid(True, alpha=0.3)
-    ax2.legend()
+    ax2.legend(fontsize=8)
     
     # SUBPLOT 3: NEW - Monthly aggregation
     # Create DataFrame for monthly resampling
@@ -1386,7 +1701,7 @@ def plot_fitted_vs_actuals(model, forecast, y_full, test_size, log_transform=Tru
         
         monthly_stats = f"Monthly R²: {monthly_r2:.4f}\nMonthly MAPE: {monthly_mape:.2f}%"
         ax3.text(0.05, 0.95, monthly_stats, 
-                transform=ax3.transAxes, fontsize=12, verticalalignment='top',
+                transform=ax3.transAxes, fontsize=8, verticalalignment='top',
                 bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
     except Exception as e:
         print(f"Error calculating monthly statistics: {e}")
@@ -1396,10 +1711,10 @@ def plot_fitted_vs_actuals(model, forecast, y_full, test_size, log_transform=Tru
     ax3.set_ylabel('Monthly Average Value')
     ax3.set_title(f"{title} (Monthly Aggregation)")
     ax3.grid(True, alpha=0.3)
-    ax3.legend()
+    ax3.legend(fontsize=8)
     
     # Format x-axis dates to prevent overcrowding on all subplots
-    fig.autofmt_xdate()
+    # fig.autofmt_xdate()
     
     plt.tight_layout()
     plt.show()
@@ -1745,15 +2060,6 @@ def plot_variable_evaluation_enhanced(eval_results, y, X):
                         bbox_to_anchor=(0.5, -0.15), ncol=2)
         
         ax_monthly.set_title(f'Monthly {var_name} vs. Target')
-        
-        # # Add recommendation banners if available
-        # for rec in eval_results.get('recommended_vars', []):
-        #     if rec['variable'] == var_name:
-        #         recommendation = f"RECOMMENDATION: {var_name} is recommended\nReason: {rec['reason']}"
-        #         fig.text(0.5, 0.98 - (var_idx/len(variables)), recommendation,
-        #                  ha='center', va='top', fontsize=12,
-        #                  bbox=dict(facecolor='lightyellow', alpha=0.9, boxstyle='round'))
-        #         break
     
     # Add overall title
     fig.suptitle("Variable Evaluation Analysis", fontsize=16, y=0.99)
@@ -1859,14 +2165,7 @@ def export_model_artifacts(results, output_dir='exports', include_plots=True):
             fitted_vs_actuals_fig.savefig(fitted_vs_actuals_path)
             plt.close(fitted_vs_actuals_fig)
             print(f"Exported fitted vs actuals plot to: {fitted_vs_actuals_path}")
-        
-        # # Export components plot using stored figure
-        # if 'components_fig' in results and results['components_fig'] is not None:
-        #     components_fig = results['components_fig']
-        #     components_plot_path = os.path.join(plots_dir, f'components_plot_{timestamp}.png')
-        #     components_fig.savefig(components_plot_path)
-        #     plt.close(components_fig)
-        #     print(f"Exported components plot to: {components_plot_path}")
+
         
         # Export regressor importance plot using stored figure
         if 'reg_importance_fig' in results and results['reg_importance_fig'] is not None:
@@ -1906,7 +2205,8 @@ def run_prophet_pipeline(
     country_code=None,
     date_dummies=None,
     evaluate_covariates=True,
-    max_lag_for_evaluation=70
+    max_lag_for_evaluation=70,
+    use_prophet_holidays=False
 ):
     """
     Run the complete Prophet forecasting pipeline.
@@ -1970,6 +2270,23 @@ def run_prophet_pipeline(
     # 2. Prepare data for Prophet
     print("\nPreparing data for Prophet...")
     prophet_df, prophet_X_df = prepare_prophet_data(y, X, X_df, lags, log_transform, date_dummies)
+
+    # Create holiday dummy variables if country_code is specified but we're not using Prophet's holidays
+    if country_code and not use_prophet_holidays:
+        print(f"\nGenerating holiday dummies for {country_code}...")
+        # Initialize date_dummies if needed
+        if date_dummies is None:
+            date_dummies = []
+            
+        # Get min and max dates from the data
+        min_date = y.index.min()
+        max_date = y.index.max()
+        
+        # Generate holiday dummies based on country code
+        if country_code.upper() == 'BR':
+            holiday_dummies = create_brazil_holiday_dummies(min_date, max_date)
+            date_dummies.extend(holiday_dummies)
+            print(f"Added {len(holiday_dummies)} Brazilian holiday dummies to date_dummies")
     
     # 3. Split data
     print("\nSplitting data into train and test sets...")
@@ -1988,7 +2305,7 @@ def run_prophet_pipeline(
         X_cols=X_cols, 
         yearly_seasonality=yearly_seasonality, 
         weekly_seasonality=weekly_seasonality,
-        country_code=country_code  # Pass country_code to the function
+        country_code=country_code if use_prophet_holidays else None
     )
     
     # 6. Make predictions
@@ -2030,8 +2347,8 @@ def run_prophet_pipeline(
         title="Prophet Model Fit"
     )
 
-    # print("\nPlotting model components...")
-    # components_fig = plot_components(model, forecast, log_transform)
+    print("\nPlotting model components...")
+    components_fig = plot_components(model, forecast, log_transform)
 
     print("\nPlotting complete forecast with historical data...")
     forecast_fig, _ = plot_forecast(
@@ -2123,7 +2440,8 @@ if __name__ == "__main__":
         lags=[1, 7, 14, 28],
         log_transform=True,
         country_code='BR',
-        date_dummies=date_dummies
+        date_dummies=date_dummies,
+        use_prophet_holidays=False
     )
 
     # # Export model artifacts
