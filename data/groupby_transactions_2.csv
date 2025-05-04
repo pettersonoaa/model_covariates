@@ -1,4 +1,4 @@
-date,transactions,dayofweek,is_weekend,is_dayofweek_7,is_dayofweek_6,is_dayofweek_5,is_dayofweek_4,is_dayofweek_3,is_dayofweek_2,is_dayofweek_1
+date,transactions,calendar_dayofweek,calendar_is_weekend,calendar_is_dayofweek_7,calendar_is_dayofweek_6,calendar_is_dayofweek_5,calendar_is_dayofweek_4,calendar_is_dayofweek_3,calendar_is_dayofweek_2,calendar_is_dayofweek_1
 2013-01-01,770.0,1,1.0,1.0,1.0,1.0,1.0,2.718281828459045,1.0,1.0
 2013-01-02,93215.0,2,1.0,1.0,1.0,1.0,2.718281828459045,1.0,1.0,1.0
 2013-01-03,78504.0,3,1.0,1.0,1.0,2.718281828459045,1.0,1.0,1.0,1.0

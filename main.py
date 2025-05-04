@@ -122,6 +122,7 @@ def apply_log_transform(data, epsilon=1e-9):
     Returns:
         pd.Series or pd.DataFrame: Log-transformed data.
     """
+
     transformed = data.copy()
     if isinstance(data, pd.Series):
         zero_mask = transformed <= 0
@@ -159,13 +160,19 @@ def add_lags(data, lags):
 
     original_cols = df.columns.tolist()
     for col in original_cols:
+        if 'dummy' in col or 'calendar' in col:
+            continue # Skip dummy and calendar columns
         for lag in lags:
-            if lag > 0:
+            if lag >= 0:
                 df[f"{col}_lag_{lag}"] = df[col].shift(lag)
 
     # Fill NaNs resulting from shifts (use backfill then forward fill)
     df = df.bfill().ffill()
     print(f"  Added lags: {lags} for columns: {original_cols}")
+    
+    # original_cols = [col for col in original_cols if 'dummy' not in col and 'calendar' not in col]
+    # df = df.drop(columns=original_cols, axis=1) # Drop original columns to avoid redundancy
+    
     return df
 
 def create_brazil_holiday_dummies_spec(start_date, end_date):
@@ -386,7 +393,70 @@ def add_date_dummies(df, date_patterns):
     print(f"  Added/updated date dummy columns: {[p['name'] for p in date_patterns]}")
     return result_df
 
-def prepare_prophet_input(y, X=None, lags=None, log_transform=True, date_dummies=None):
+def prepare_prophet_input_X(X=None, lags=None, log_transform=True, date_dummies=None, covariates=None):
+    """
+    Prepare the input DataFrame for Prophet, including transformations and features.
+
+    Args:
+        y (pd.Series): Target time series.
+        X (pd.DataFrame, optional): Covariate DataFrame.
+        lags (list, optional): List of lag periods for covariates.
+        log_transform (bool): Whether to apply log transform.
+        date_dummies (list, optional): Specifications for date dummy variables.
+
+    Returns:
+        pd.DataFrame: DataFrame ready for Prophet training/prediction.
+    """
+    print("Preparing data for Prophet...")
+    df = pd.DataFrame({'ds': X.index})
+    all_regressor_cols = []
+
+    # 2. Process Covariates (Log Transform, Lags)
+    if X is not None:
+        # X_aligned = X.reindex(df['ds']) # Align covariates with target dates
+        X_aligned = X
+        print(f"  Processing {len(X_aligned.columns)} covariates.")
+
+        # Log Transform (Covariates)
+        if log_transform:
+            # Identify columns to transform and columns to skip
+            transform_cols = [col for col in X_aligned.columns 
+                             if 'dummy' not in col.lower() and 'calendar' not in col.lower()]
+            skip_cols = [col for col in X_aligned.columns 
+                        if 'dummy' in col.lower() or 'calendar' in col.lower()]
+            
+            X_processed = X_aligned.copy()
+            
+            if transform_cols:
+                print(f"  Applying log transform to {len(transform_cols)} covariates")
+                X_processed[transform_cols] = apply_log_transform(X_aligned[transform_cols])
+            
+            if skip_cols:
+                print(f"  Skipping log transform for {len(skip_cols)} calendar/dummy covariates: {skip_cols}")
+        else:
+            X_processed = X_aligned.copy()
+
+        # Add Lags (Covariates)
+        if lags:
+            X_processed = add_lags(X_processed, lags)
+
+        # Add processed covariate columns to the main DataFrame
+        for col in X_processed.columns:
+            if col not in df.columns: 
+                df[col] = X_processed[col].values
+                all_regressor_cols.append(col)
+
+    # 3. Add Date Dummies
+    if date_dummies:
+        df = add_date_dummies(df, date_dummies)
+        dummy_names = [p['name'] for p in date_dummies]
+        all_regressor_cols.extend(dummy_names)
+
+    print(f"  Prepared DataFrame shape: {df.shape}")
+    print(f"  Regressor columns added: {all_regressor_cols}")
+    return df, all_regressor_cols
+
+def prepare_prophet_input_y(y, log_transform=True):
     """
     Prepare the input DataFrame for Prophet, including transformations and features.
 
@@ -402,46 +472,13 @@ def prepare_prophet_input(y, X=None, lags=None, log_transform=True, date_dummies
     """
     print("Preparing data for Prophet...")
     df = pd.DataFrame({'ds': y.index, 'y': y.values})
-    all_regressor_cols = []
 
     # 1. Log Transform (Target)
     if log_transform:
         print("  Applying log transform to target 'y'")
         df['y'] = apply_log_transform(df['y']).values
 
-    # 2. Process Covariates (Log Transform, Lags)
-    if X is not None:
-        X_aligned = X.reindex(df['ds']) # Align covariates with target dates
-        print(f"  Processing {len(X_aligned.columns)} covariates.")
-
-        # Log Transform (Covariates)
-        X_processed = apply_log_transform(X_aligned) if log_transform else X_aligned.copy()
-
-        # Add Lags (Covariates)
-        if lags:
-            X_processed = add_lags(X_processed, lags)
-
-        # Add processed covariate columns to the main DataFrame
-        for col in X_processed.columns:
-            if col not in df.columns: # Avoid overwriting 'ds' or 'y'
-                df[col] = X_processed[col].values
-                all_regressor_cols.append(col)
-
-    # 3. Add Date Dummies
-    if date_dummies:
-        df = add_date_dummies(df, date_dummies)
-        dummy_names = [p['name'] for p in date_dummies]
-        all_regressor_cols.extend(dummy_names)
-
-    # Ensure no NaNs remain after feature engineering
-    initial_len = len(df)
-    df.dropna(inplace=True)
-    if len(df) < initial_len:
-        print(f"  WARNING: Dropped {initial_len - len(df)} rows with NaNs after feature engineering.")
-
-    print(f"  Prepared DataFrame shape: {df.shape}")
-    print(f"  Regressor columns added: {all_regressor_cols}")
-    return df, all_regressor_cols
+    return df
 
 def split_data(df, test_size):
     """Split DataFrame into training and testing sets."""
@@ -542,11 +579,6 @@ def generate_future_df(last_hist_date, periods, regressor_cols=None, hist_data=N
     combined_df.sort_values('ds', inplace=True)
     combined_df.reset_index(drop=True, inplace=True)
 
-    # Generate date-based features directly on combined_df
-    if 'is_weekend' in regressor_cols:
-        combined_df['is_weekend'] = (combined_df['ds'].dt.dayofweek >= 5).astype(int)
-    # Add other date-based features (dayofweek, month, day) similarly if needed
-
     # Generate date dummies on combined_df
     if date_dummies:
         dummy_names = [p['name'] for p in date_dummies if p['name'] in regressor_cols]
@@ -557,7 +589,6 @@ def generate_future_df(last_hist_date, periods, regressor_cols=None, hist_data=N
     # Handle continuous and lagged features
     lag_pattern = '_lag_'
     processed_lags = set()
-
     for col in regressor_cols:
         if col in future_df.columns: # Already generated (e.g., date-based)
             continue
@@ -567,23 +598,17 @@ def generate_future_df(last_hist_date, periods, regressor_cols=None, hist_data=N
             try:
                 lag = int(lag_str)
                 if base_col not in combined_df.columns:
-                     # Need to generate base column first if it's date-based and wasn't explicitly requested
-                    if base_col == 'is_weekend':
-                         combined_df['is_weekend'] = (combined_df['ds'].dt.dayofweek >= 5).astype(int)
-                    # Add logic for other potential base date features if needed
-                    else:
-                        print(f"  WARNING: Base column '{base_col}' for lag '{col}' not found. Assuming 0.")
-                        combined_df[base_col] = 0 # Fallback
-
+                    print(f"  WARNING: Base column '{base_col}' for lag '{col}' not found. Assuming 0.")
+                    combined_df[base_col] = 0 # Fallback
+                        
                 # Calculate the lag on the combined dataframe
                 combined_df[col] = combined_df[base_col].shift(lag)
                 processed_lags.add(col)
-
             except ValueError:
                 print(f"  WARNING: Could not parse lag from '{col}'. Assuming 0.")
                 combined_df[col] = 0
         elif col not in combined_df.columns: # Continuous variable not generated yet
-             # Use last known value from historical data if available
+            # Use last known value from historical data if available
             if hist_data is not None and col in hist_data.columns:
                 last_value = hist_data[col].iloc[-1]
                 print(f"  Using last known value ({last_value:.4f}) for future '{col}'")
@@ -620,35 +645,6 @@ def calculate_mape(y_true, y_pred):
         return np.nan
     return np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100
 
-def analyze_regressor_importance(model, forecast):
-    """Calculate and print importance metrics for model regressors."""
-    print("\nAnalyzing regressor importance...")
-    regressors = list(getattr(model, 'extra_regressors', {}).keys())
-    if not regressors:
-        print("  No regressors found in the model.")
-        return {}
-
-    importance = {}
-    for reg in regressors:
-        if reg in forecast.columns:
-            abs_mean = np.abs(forecast[reg]).mean()
-            importance[reg] = {
-                'abs_mean': abs_mean,
-                'std': forecast[reg].std(),
-                'min': forecast[reg].min(),
-                'max': forecast[reg].max(),
-                'range': forecast[reg].max() - forecast[reg].min()
-            }
-
-    sorted_importance = dict(sorted(importance.items(), key=lambda item: item[1]['abs_mean'], reverse=True))
-
-    print("-" * 60)
-    print(f"{'Regressor':<30} | {'Abs Mean':>10} | {'Range':>10}")
-    print("-" * 60)
-    for reg, metrics in sorted_importance.items():
-        print(f"{reg:<30} | {metrics['abs_mean']:>10.4f} | {metrics['range']:>10.4f}")
-    print("-" * 60)
-    return sorted_importance
 
 def evaluate_covariates(y, X, max_lag=70, alpha=0.05):
     """
@@ -743,26 +739,6 @@ def evaluate_covariates(y, X, max_lag=70, alpha=0.05):
     return results
 
 # --- Visualization ---
-
-def plot_regressor_importance(importance, top_n=None, show=True):
-    """Plot regressor importance as a horizontal bar chart."""
-    if not importance: return None
-    regressors = list(importance.keys())[:top_n]
-    values = [metrics['abs_mean'] for metrics in importance.values()][:top_n]
-    regressors.reverse() # Plot highest importance at the top
-    values.reverse()
-
-    fig, ax = plt.subplots(figsize=(10, max(6, len(regressors) * 0.5)))
-    bars = ax.barh(regressors, values, color=DEFAULT_COLOR_STANDARD)
-    ax.set_xlabel('Absolute Mean Contribution')
-    ax.set_title(f'Top {len(regressors)} Regressor Importances' if top_n else 'Regressor Importance')
-    ax.grid(axis='x', linestyle='--', alpha=0.6)
-    for bar in bars: # Add value labels
-        width = bar.get_width()
-        ax.text(width * 1.01, bar.get_y() + bar.get_height()/2, f'{width:.4f}', va='center')
-    plt.tight_layout()
-    if show: plt.show()
-    return fig
 
 def plot_covariate_evaluation(eval_results, y, X, show=True):
     """Plot detailed evaluation for each covariate."""
@@ -1165,30 +1141,53 @@ def plot_forecast_results(forecast, y_full, test_size, log_transform=True,
     hist_mask = train_dates >= history_cutoff if history_cutoff else slice(None)
     hist_dates, hist_values = train_dates[hist_mask], train_values[hist_mask]
 
-    # Prepare forecast data
+    # Ensure proper inverse transform for all forecast values
     fcst_dates = pd.to_datetime(forecast['ds'])
-    yhat = np.expm1(forecast['yhat']) if log_transform else forecast['yhat']
-    yhat_lower = np.expm1(forecast['yhat_lower']) if log_transform else forecast['yhat_lower']
-    yhat_upper = np.expm1(forecast['yhat_upper']) if log_transform else forecast['yhat_upper']
-
+    
+    # Find which indices in the forecast correspond to test dates
+    test_dates_str = [d.strftime('%Y-%m-%d') for d in test_dates]
+    forecast_dates_str = [d.strftime('%Y-%m-%d') for d in fcst_dates]
+    test_mask = [d in test_dates_str for d in forecast_dates_str]
+    
+    # Apply inverse transform for test period forecast
+    yhat = np.expm1(forecast['yhat'].values) if log_transform else forecast['yhat'].values
+    
     # Plotting
     ax.plot(hist_dates, hist_values, color=DEFAULT_COLOR_ACTUAL, lw=0.7, label='Trainning Actuals')
-    ax.plot(test_dates, test_values, color=DEFAULT_COLOR_ACTUAL, lw=2, label='Test Actuals') # Make test actuals clearer
-    ax.plot(fcst_dates, yhat, color=DEFAULT_COLOR_PREDICTED, lw=2, alpha=0.7, label='Test Prediction')
+    ax.plot(test_dates, test_values, color=DEFAULT_COLOR_ACTUAL, lw=2, label='Test Actuals')
+    
+    # Plot test period predictions
+    if any(test_mask):
+        test_fcst_dates = fcst_dates[test_mask]
+        test_yhat = yhat[test_mask]
+        ax.plot(test_fcst_dates, test_yhat, color=DEFAULT_COLOR_PREDICTED, lw=2, alpha=0.7, label='Test Prediction')
 
-    # Plot future forecast if available
+    # Plot future forecast if available - handle the inverse transform carefully
     if future_forecast is not None:
         future_dates = pd.to_datetime(future_forecast['ds'])
-        future_yhat = np.expm1(future_forecast['yhat']) if log_transform else future_forecast['yhat']
-        future_lower = np.expm1(future_forecast['yhat_lower']) if log_transform else future_forecast['yhat_lower']
-        future_upper = np.expm1(future_forecast['yhat_upper']) if log_transform else future_forecast['yhat_upper']
-        ax.plot(future_dates, future_yhat, color=DEFAULT_COLOR_FORECAST, lw=2, linestyle='-', label='Forecast')
-        ax.fill_between(future_dates, future_lower, future_upper, color=DEFAULT_COLOR_FORECAST, alpha=0.15)
+        
+        # IMPORTANT: Apply inverse transform to future predictions 
+        future_yhat = np.expm1(future_forecast['yhat'].values) if log_transform else future_forecast['yhat'].values
+        future_lower = np.expm1(future_forecast['yhat_lower'].values) if log_transform else future_forecast['yhat_lower'].values
+        future_upper = np.expm1(future_forecast['yhat_upper'].values) if log_transform else future_forecast['yhat_upper'].values
+        
+        # Only plot future dates that come after the test period
+        last_test_date = test_dates[-1]
+        future_mask = [d > last_test_date for d in future_dates]
+        
+        if any(future_mask):
+            future_plot_dates = future_dates[future_mask]
+            future_plot_yhat = future_yhat[future_mask]
+            future_plot_lower = future_lower[future_mask]
+            future_plot_upper = future_upper[future_mask]
+            
+            ax.plot(future_plot_dates, future_plot_yhat, color=DEFAULT_COLOR_FORECAST, lw=2, label='Forecast')
+            ax.fill_between(future_plot_dates, future_plot_lower, future_plot_upper, color=DEFAULT_COLOR_FORECAST, alpha=0.15)
 
     # Formatting
     ax.axvline(train_dates[-1], color=DEFAULT_COLOR_PREDICTED, linestyle=':', lw=1, label='Train/Test Split')
     if future_forecast is not None:
-         ax.axvline(test_dates[-1], color=DEFAULT_COLOR_FORECAST, linestyle=':', lw=1, label='Forecast Start')
+        ax.axvline(test_dates[-1], color=DEFAULT_COLOR_FORECAST, linestyle=':', lw=1, label='Forecast Start')
 
     ax.set_xlabel('Date')
     ax.set_ylabel('Value')
@@ -1200,6 +1199,7 @@ def plot_forecast_results(forecast, y_full, test_size, log_transform=True,
     plt.tight_layout()
     if show: plt.show()
     return fig
+
 
 def plot_model_components(model, forecast, show=True):
     """Plot Prophet model components."""
@@ -1340,7 +1340,9 @@ def run_prophet_pipeline(
     y, X = load_data(target_path, covariate_path, date_col, target_col, covariate_cols)
     if y is None: return {"error": "Failed to load target data."}
     results['y_full'] = y
+    transformable_cols = [col for col in X.columns if 'dummy' not in col.lower() and 'calendar' not in col.lower()]
 
+    
     # 2. Evaluate Covariates (Optional)
     results['fig_covariate_evaluation'] = None
     # Use the renamed parameter in the condition
@@ -1362,7 +1364,17 @@ def run_prophet_pipeline(
     results['date_dummies'] = all_date_dummies
 
     # 4. Prepare Prophet Input Data (Transformations, Features)
-    prophet_df, regressor_cols = prepare_prophet_input(y, X, lags, log_transform, all_date_dummies)
+    transformed_y_df = prepare_prophet_input_y(y, log_transform)
+    transformed_X_df, transformed_X_cols = prepare_prophet_input_X(X, lags, log_transform, all_date_dummies)
+    #  transformed_df, transformed_cols = prepare_prophet_input(y, X, lags, log_transform, all_date_dummies)
+    original_covariates_cols = [col for col in X.columns if 'dummy' not in col and 'calendar' not in col]
+    regressor_cols = [col for col in transformed_X_cols if col not in original_covariates_cols]
+
+    prophet_df = transformed_X_df.copy()
+    prophet_df['y'] = transformed_y_df['y']
+    prophet_df = prophet_df.reset_index(drop=False) # Reset index to avoid issues with Prophet
+    prophet_df = prophet_df[['ds', 'y'] + regressor_cols]
+    prophet_df = prophet_df.dropna() # Drop rows with NaN values
     results['regressor_cols'] = regressor_cols
 
     # 5. Split Data
@@ -1371,7 +1383,8 @@ def run_prophet_pipeline(
     # 6. Train Model
     model = train_model(train_df, regressor_cols, yearly_seasonality, weekly_seasonality, daily_seasonality)
     results['model'] = model
-
+    
+    
     # 7. Make Predictions (Test Period)
     # Ensure test_df has all necessary regressor columns
     test_future_df = test_df[['ds'] + regressor_cols].copy()
@@ -1388,7 +1401,7 @@ def run_prophet_pipeline(
     if future_periods > 0:
         last_hist_date = prophet_df['ds'].iloc[-1]
         # Pass historical data including regressors for lag calculation
-        hist_data_for_future = prophet_df[['ds'] + regressor_cols].copy()
+        hist_data_for_future = transformed_X_df[['ds'] + transformed_X_cols].copy()
         future_df = generate_future_df(last_hist_date, future_periods, regressor_cols, hist_data_for_future, all_date_dummies)
         if not future_df.empty:
              results['forecast_future'] = make_predictions(model, future_df)
@@ -1402,9 +1415,7 @@ def run_prophet_pipeline(
 
     results['mape'] = calculate_mape(y_test_actual_orig.values, y_pred_test)
     print(f"\nEvaluation on Test Set: MAPE = {results['mape']:.2f}%")
-
-    results['regressor_importance'] = analyze_regressor_importance(model, forecast_test) # Use test forecast for importance
-
+    
     # 11. Generate Plots
     print("\nGenerating plots...")
     results['fig_model_fit'] = plot_model_fit(
@@ -1422,9 +1433,7 @@ def run_prophet_pipeline(
         title=f"Prophet Forecast (Test MAPE: {results['mape']:.2f}%)",
         show=False
     )
-    if results['regressor_importance']:
-        results['fig_regressor_importance'] = plot_regressor_importance(results['regressor_importance'], show=False)
-
+    
     # 12. Export Artifacts
     export_artifacts(results)
 
@@ -1440,11 +1449,11 @@ if __name__ == "__main__":
 
     COVARIATE_COLS_TO_USE = [
         'transactions',
-        'is_weekend',
+        # 'calendar_is_weekend',
         # Add other covariates as needed
     ]
 
-    LAGS_TO_GENERATE = [1, 7, 14, 28]
+    LAGS_TO_GENERATE = [0, 1, 7, 14, 28]
 
     CUSTOM_DATE_DUMMIES = [
         {
