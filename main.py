@@ -11,13 +11,16 @@ Includes:
 """
 
 import pandas as pd
+from pandas.tseries.offsets import MonthEnd, MonthBegin
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from prophet import Prophet
+from prophet.utilities import regressor_coefficients
 import pickle
 import os
 import re
+import calendar
 from datetime import datetime, timedelta
 from scipy import stats
 from statsmodels.stats.stattools import durbin_watson
@@ -393,7 +396,13 @@ def add_date_dummies(df, date_patterns):
     # print(f"  Added/updated date dummy columns: {[p['name'] for p in date_patterns]}")
     return result_df
 
-def prepare_prophet_input_X(X=None, lags=None, log_transform=True, date_dummies=None, covariates=None):
+def prepare_prophet_input_X(
+        X=None, 
+        lags=None, 
+        log_transform=True, 
+        date_dummies=None, 
+        add_recent_weekday_dummies=False
+    ):
     """
     Prepare the input DataFrame for Prophet, including transformations and features.
 
@@ -403,11 +412,16 @@ def prepare_prophet_input_X(X=None, lags=None, log_transform=True, date_dummies=
         lags (list, optional): List of lag periods for covariates.
         log_transform (bool): Whether to apply log transform.
         date_dummies (list, optional): Specifications for date dummy variables.
+        add_recent_weekday_dummies (bool): Add dummies for weekdays in last 3 months.
 
     Returns:
         pd.DataFrame: DataFrame ready for Prophet training/prediction.
     """
     print("Preparing data for Prophet...")
+    if X is None:
+        print("  ERROR: Covariate DataFrame X is required for prepare_prophet_input_X.")
+        return pd.DataFrame(), []
+    
     df = pd.DataFrame({'ds': X.index})
     all_regressor_cols = []
 
@@ -451,6 +465,27 @@ def prepare_prophet_input_X(X=None, lags=None, log_transform=True, date_dummies=
         df = add_date_dummies(df, date_dummies)
         dummy_names = [p['name'] for p in date_dummies]
         all_regressor_cols.extend(dummy_names)
+    
+    # --- ADDED: Add Recent Weekday Dummies ---
+    if add_recent_weekday_dummies:
+        print("  Adding recent weekday dummies (last 3 months)...")
+        if not df.empty and 'ds' in df.columns:
+            last_date = df['ds'].max()
+            three_months_prior = last_date - pd.DateOffset(months=3)
+            df['weekday'] = df['ds'].dt.weekday # 0=Monday, 6=Sunday
+
+            for weekday in range(7):
+                weekday_name = calendar.day_name[weekday].lower()
+                col_name = f'recent_{weekday_name}_dummy'
+                # Create dummy: 1 if date >= threshold AND it's the correct weekday, else 0
+                df[col_name] = ((df['ds'] >= three_months_prior) & (df['weekday'] == weekday)).astype(float)
+                all_regressor_cols.append(col_name)
+                print(f"    Added: {col_name}")
+
+            df = df.drop(columns=['weekday']) # Remove temporary column
+        else:
+            print("  WARNING: Cannot add recent weekday dummies, DataFrame is empty or missing 'ds'.")
+    # --- END ADDED ---
 
     print(f"  Prepared DataFrame shape: {df.shape}")
     print(f"  Regressor columns added: {all_regressor_cols}")
@@ -511,6 +546,7 @@ def train_model(train_df, regressor_cols=None, yearly_seasonality=True,
         yearly_seasonality=yearly_seasonality,
         weekly_seasonality=weekly_seasonality,
         daily_seasonality=daily_seasonality,
+        uncertainty_samples=10000
         # holidays=holidays_df, # Using dummies as regressors instead
         # holidays_prior_scale=10.0 # Not needed when using dummies
     )
@@ -1200,7 +1236,6 @@ def plot_forecast_results(forecast, y_full, test_size, log_transform=True,
     if show: plt.show()
     return fig
 
-
 def plot_model_components(model, forecast, show=True):
     """Plot Prophet model components."""
     print("Plotting model components...")
@@ -1213,6 +1248,128 @@ def plot_model_components(model, forecast, show=True):
         print(f"  ERROR plotting components: {e}")
         return None
 
+def plot_regressor_coefficients(model, show=True):
+    """
+    Plot the estimated coefficients (posterior means) for the extra regressors
+    added to the model, showing uncertainty intervals (coef_lower, coef_upper).
+
+    Significance can be inferred by checking if the uncertainty interval (error bar)
+    crosses the zero line.
+
+    Args:
+        model (Prophet): Trained Prophet model instance.
+        show (bool): Whether to display the plot immediately.
+
+    Returns:
+        matplotlib.figure.Figure: The figure object, or None if no regressors or error.
+    """
+    print("Plotting regressor coefficients with uncertainty intervals...")
+    if not model.extra_regressors:
+        print("  No extra regressors found in the model.")
+        return None
+
+    try:
+        # Use Prophet's utility to get coefficients including uncertainty intervals
+        coef_df = regressor_coefficients(model)
+
+        if coef_df.empty:
+            print("  Could not extract regressor coefficients using Prophet utility.")
+            return None
+
+        # Sort by absolute coefficient value for better visualization
+        coef_df = coef_df.reindex(coef_df['coef'].abs().sort_values(ascending=True).index)
+
+        # --- DEBUG: Print head of coef_df ---
+        print("DEBUG: Head of sorted coef_df:")
+        print(coef_df)
+        # --- End DEBUG ---
+
+        fig, ax = plt.subplots(figsize=(12, max(6, len(coef_df) * 0.4)))
+
+        # --- ADD BACK: Determine colors based on whether the interval contains zero ---
+        colors = []
+        for _, row in coef_df.iterrows():
+            if row['coef_lower'] < 0 < row['coef_upper']:
+                colors.append(DEFAULT_COLOR_STANDARD) # Grey if interval contains zero
+            elif row['coef'] > 0:
+                colors.append(DEFAULT_COLOR_HIGHLIGHT) # Orange if positive and interval doesn't contain zero
+            else:
+                colors.append(DEFAULT_COLOR_COMPONENT) # Blue if negative and interval doesn't contain zero
+        # --- END ADD BACK ---
+
+        y_pos = np.arange(len(coef_df))
+
+        # --- Plot each error bar and marker individually ---
+        print("DEBUG: Checking error bar values...")
+        non_zero_errors_found = False
+
+        for i, regressor_index in enumerate(coef_df.index):
+            row = coef_df.loc[regressor_index]
+            current_y = y_pos[i]
+            current_coef = row['coef']
+            current_color = colors[i]
+
+            # Calculate asymmetric error (original calculation)
+            lower_bound = row['coef_lower']
+            upper_bound = row['coef_upper']
+            current_lower_err = current_coef - lower_bound # Reverted max(0,...) just in case
+            current_upper_err = upper_bound - current_coef # Reverted max(0,...) just in case
+            current_xerr = [[current_lower_err], [current_upper_err]]
+
+            is_error_visible = (abs(current_lower_err) > 1e-9 or abs(current_upper_err) > 1e-9) # Check absolute value
+            if is_error_visible:
+                non_zero_errors_found = True
+                ax.errorbar(x=current_coef, y=current_y, xerr=current_xerr, fmt='none',
+                            ecolor=current_color, elinewidth=2, capsize=4)
+
+            ax.plot(current_coef, current_y, 'o', color='black', markersize=5)
+
+            # if i < 5:
+            #    print(f"  Reg: {regressor_index}, Coef: {current_coef:.4f}, Lower: {lower_bound:.4f}, Upper: {upper_bound:.4f}, L_Err: {current_lower_err:.4f}, U_Err: {current_upper_err:.4f}, Visible: {is_error_visible}")
+
+
+        if not non_zero_errors_found:
+            print("DEBUG: No significant error bar lengths found to plot.")
+
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(coef_df['regressor'])
+
+        ax.axvline(0, color='black', linestyle='--', alpha=0.7)
+
+        # --- Explicitly set X-limits ---
+        min_lim = coef_df['coef_lower'].min()
+        max_lim = coef_df['coef_upper'].max()
+        padding = (max_lim - min_lim) * 0.15 # Add 15% padding
+        ax.set_xlim(min_lim - padding, max_lim + padding)
+        print(f"DEBUG: Setting x-limits to: ({min_lim - padding:.4f}, {max_lim + padding:.4f})")
+        # --- End set X-limits ---
+
+        # --- Add coefficient value labels (optional, can get crowded) ---
+        for i, row in coef_df.iterrows():
+            width = row['coef']
+            # Adjust label position slightly based on error bar extent
+            label_x_pos = row['coef_upper'] + abs(row['coef_upper'])*0.10 if width >= 0 else row['coef_lower'] - abs(row['coef_lower'])*0.10
+            ha = 'left' if width >= 0 else 'right'
+            ax.text(label_x_pos, y_pos[coef_df.index.get_loc(i)],
+                      f'{width:.3f}',
+                      va='center', ha=ha, fontsize=7)
+        # --- End Add labels ---
+
+        ax.set_xlabel('Estimated Coefficient (Posterior Mean with 95% Interval)')
+        ax.set_ylabel('Regressor')
+        ax.set_title('Extra Regressor Coefficients and Uncertainty')
+        ax.grid(True, axis='x', alpha=0.3)
+        plt.tight_layout()
+
+        if show:
+            plt.show()
+        return fig
+
+    except Exception as e:
+        print(f"  ERROR plotting regressor coefficients: {e}")
+        import traceback
+        traceback.print_exc() # Print full traceback for debugging this plot
+        return None
 
 def simulate_rolling_forecast(
     prophet_df,
@@ -1496,7 +1653,7 @@ def export_artifacts(results, output_dir=DEFAULT_OUTPUT_DIR):
         'fig_model_fit': 'model_fit',
         'fig_components': 'components',
         'fig_forecast': 'forecast',
-        'fig_regressor_importance': 'regressor_importance',
+        'fig_regressor_coefficients': 'regressor_coefficients', 
         'fig_covariate_evaluation': 'covariate_evaluation'
     }
     for key, name in plot_keys.items():
@@ -1530,6 +1687,7 @@ def run_prophet_pipeline(
     daily_seasonality=False,
     country_code_holidays=None, # Use None to disable Prophet holidays, 'BR' for Brazil dummies
     custom_date_dummies=None,
+    add_recent_weekday_dummies=False,
     perform_covariate_evaluation=True,
     max_lag_for_evaluation=70,
     output_dir=DEFAULT_OUTPUT_DIR
@@ -1594,7 +1752,7 @@ def run_prophet_pipeline(
 
     # 4. Prepare Prophet Input Data (Transformations, Features)
     transformed_y_df = prepare_prophet_input_y(y, log_transform)
-    transformed_X_df, transformed_X_cols = prepare_prophet_input_X(X, lags, log_transform, all_date_dummies)
+    transformed_X_df, transformed_X_cols = prepare_prophet_input_X(X, lags, log_transform, all_date_dummies, add_recent_weekday_dummies)
     #  transformed_df, transformed_cols = prepare_prophet_input(y, X, lags, log_transform, all_date_dummies)
     original_covariates_cols = [col for col in X.columns if 'dummy' not in col and 'calendar' not in col]
     regressor_cols = [col for col in transformed_X_cols if col not in original_covariates_cols]
@@ -1612,8 +1770,10 @@ def run_prophet_pipeline(
     # 6. Train Model
     model = train_model(train_df, regressor_cols, yearly_seasonality, weekly_seasonality, daily_seasonality)
     results['model'] = model
-    
-    
+    results['fig_regressor_coefficients'] = None
+    if regressor_cols: # Only plot if regressors were used
+        results['fig_regressor_coefficients'] = plot_regressor_coefficients(model, show=False)
+
     # 7. Make Predictions (Test Period)
     # Ensure test_df has all necessary regressor columns
     test_future_df = test_df[['ds'] + regressor_cols].copy()
@@ -1695,6 +1855,8 @@ if __name__ == "__main__":
         # Add more custom events if needed
     ]
 
+    ADD_RECENT_WEEKDAY_DUMMIES = True
+
     TEST_SIZE = 28
     FUTURE_PERIODS = 28
     SIMULATION_DAYS = 28
@@ -1713,6 +1875,7 @@ if __name__ == "__main__":
         daily_seasonality=False, # Usually False for daily data unless strong intra-day pattern
         country_code_holidays='BR', # Use 'BR' for Brazilian holiday dummies, None to disable
         custom_date_dummies=CUSTOM_DATE_DUMMIES,
+        add_recent_weekday_dummies=ADD_RECENT_WEEKDAY_DUMMIES,
         perform_covariate_evaluation=True,
         max_lag_for_evaluation=70
     )
@@ -1747,7 +1910,13 @@ if __name__ == "__main__":
 
 
                 # 3. Prepare Regressors ('ds', regressor_cols...)
-                transformed_X_df_sim, _ = prepare_prophet_input_X(X_sim, LAGS_TO_GENERATE, log_transform=True, date_dummies=all_date_dummies_sim)
+                transformed_X_df_sim, _ = prepare_prophet_input_X(
+                    X_sim, 
+                    LAGS_TO_GENERATE, 
+                    log_transform=True, 
+                    date_dummies=all_date_dummies_sim, 
+                    add_recent_weekday_dummies=ADD_RECENT_WEEKDAY_DUMMIES
+                )
                 # Ensure 'ds' is a column
                 if 'ds' not in transformed_X_df_sim.columns:
                     transformed_X_df_sim.reset_index(inplace=True)
