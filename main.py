@@ -12,6 +12,7 @@ Includes:
 
 import pandas as pd
 from pandas.tseries.offsets import MonthEnd, MonthBegin
+from tqdm import tqdm # Import tqdm for progress bar
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
@@ -1407,6 +1408,7 @@ def simulate_rolling_forecast(
 
     all_forecasts_list = [] # List to store individual forecast DataFrames
     forecast_sums = {} # Store forecast sums keyed by the date they were made *on*
+    monthly_actual_plus_forecast_sums = {} # Dictionary for monthly sums
 
     # Determine the date range for the simulation
     initial_train_end_date = prophet_df['ds'].iloc[initial_train_size - 1]
@@ -1416,9 +1418,13 @@ def simulate_rolling_forecast(
     print(f"Initial train end date: {initial_train_end_date.date()}")
     print(f"Simulation period: {simulation_start_date.date()} to {simulation_end_date.date()}")
 
-    for i in range(simulation_days):
+    # Use tqdm for progress bar
+    progress_bar = tqdm(range(simulation_days), desc="Rolling Forecast")
+
+    for i in progress_bar:
         current_train_end_date = initial_train_end_date + timedelta(days=i)
         print(f"\nSimulating Day {i+1}/{simulation_days} (Training up to {current_train_end_date.date()})")
+        # progress_bar.set_description(f"Rolling Forecast (Day {i+1}/{simulation_days}, Train End: {current_train_end_date.date()})")
 
         # 1. Prepare current training data
         current_train_df = prophet_df[prophet_df['ds'] <= current_train_end_date].copy()
@@ -1469,7 +1475,35 @@ def simulate_rolling_forecast(
                 yhat_values = np.expm1(yhat_values)
             forecast_sums[current_train_end_date] = np.sum(yhat_values)
 
-            # --- Removed individual CSV export ---
+            # --- ADDED: Calculate Monthly Actual + Forecast Sum ---
+            try:
+                # Get the month start and end for the forecast_date (current_train_end_date)
+                current_month_start = current_train_end_date - MonthBegin(1)
+                current_month_end = current_train_end_date + MonthEnd(0)
+                forecast_start_date = current_train_end_date + timedelta(days=1) # Forecast starts day after train end
+
+                # Get actuals from month start up to current_train_end_date (inclusive)
+                actuals_in_month_mask = (y_full.index >= current_month_start) & (y_full.index <= current_train_end_date)
+                actual_sum_part = y_full[actuals_in_month_mask].sum()
+
+                # Get forecast from forecast_start_date to month end
+                forecast_in_month_mask = (forecast_subset['ds'] >= forecast_start_date) & (forecast_subset['ds'] <= current_month_end)
+                forecast_sum_part_df = forecast_subset[forecast_in_month_mask]
+
+                # Inverse transform forecast if needed before summing
+                forecast_values_to_sum = forecast_sum_part_df['yhat'].values
+                if log_transform:
+                     # Ensure non-negative before expm1 if log transform was used
+                     forecast_values_to_sum = np.expm1(np.maximum(0, forecast_values_to_sum))
+
+                forecast_sum_part = np.sum(forecast_values_to_sum)
+
+                # Combine and store
+                monthly_actual_plus_forecast_sums[current_train_end_date] = actual_sum_part + forecast_sum_part
+
+            except Exception as e_month:
+                print(f"\n  WARNING: Could not calculate monthly sum for {current_train_end_date.date()}: {e_month}")
+            # --- END ADDED ---
 
         except Exception as e:
             print(f"  ERROR making prediction or calculating sum on day {i+1}: {e}")
@@ -1481,8 +1515,24 @@ def simulate_rolling_forecast(
         combined_forecasts_df = pd.concat(all_forecasts_list, ignore_index=True)
         # Reorder columns for clarity
         cols_order = ['forecast_made_on', 'ds', 'yhat', 'yhat_lower', 'yhat_upper']
+        # Ensure all columns exist, add if missing before reordering
+        for col in cols_order:
+            if col not in combined_forecasts_df.columns:
+                 combined_forecasts_df[col] = np.nan # Or some default value
         combined_forecasts_df = combined_forecasts_df[cols_order]
         combined_forecasts_df.sort_values(by=['forecast_made_on', 'ds'], inplace=True)
+
+        # --- Apply inverse transform before saving ---
+        if log_transform:
+            print("  Applying inverse transform (expm1) to combined rolling forecasts before saving...")
+            # Only transform columns that exist in the combined df
+            cols_to_transform_rolling = ['yhat', 'yhat_lower', 'yhat_upper']
+            for col in cols_to_transform_rolling:
+                if col in combined_forecasts_df.columns:
+                    combined_forecasts_df[col] = np.expm1(combined_forecasts_df[col])
+                else:
+                    print(f"    Warning: Column '{col}' not found in combined rolling forecast, skipping inverse transform for it.")
+        # --- End inverse transform ---
 
         try:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1502,106 +1552,187 @@ def simulate_rolling_forecast(
         print("No forecasts were generated, cannot create plot.")
         return None, combined_forecast_path # Return None for fig, but path might exist if export failed mid-way
 
-    # Create figure with two subplots (stacked vertically)
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 12), sharex=False, gridspec_kw={'height_ratios': [3, 1]})
-    fig.suptitle(f'Rolling Forecast Simulation ({simulation_days} days, {forecast_horizon}-day horizon)', fontsize=16, y=0.99)
+    # Pass the monthly sums to the plotting function
+    fig = plot_rolling_forecast_results(
+        all_forecasts_list, # Pass the list of forecast dfs
+        y_full,
+        initial_train_end_date,
+        simulation_end_date,
+        forecast_horizon,
+        forecast_sums,
+        monthly_actual_plus_forecast_sums, # Pass the new dictionary
+        log_transform=log_transform,
+        show=False # Control showing externally if needed
+    )
 
-    # --- Subplot 1: Rolling Forecast Lines ---
-    # Determine the full date range needed for the plot
+    # --- Save the plot ---
+    plot_path = os.path.join(DEFAULT_PLOTS_DIR, f'rolling_forecast_simulation_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png')
+    try:
+        if fig: # Check if fig was created
+            fig.savefig(plot_path)
+            print(f"Rolling forecast plot saved to: {plot_path}")
+            plt.close(fig) # Close the figure after saving
+        else:
+            print("Skipping saving rolling forecast plot as it was not generated.")
+    except Exception as e:
+        print(f"ERROR saving rolling forecast plot: {e}")
+
+
+    # Return the figure object (or None) and the path to the combined CSV
+    return fig, combined_forecast_path # Return fig object
+
+
+def plot_rolling_forecast_results(
+    all_forecasts_list, # Changed from forecast_results dict to list
+    y_full,
+    initial_train_end_date,
+    simulation_end_date,
+    forecast_horizon,
+    forecast_sums=None,
+    monthly_sums=None, # ADDED: Accept monthly sums
+    log_transform=True,
+    show=True
+):
+    """
+    Plot the results of the rolling forecast simulation with 3 subplots.
+
+    Args:
+        all_forecasts_list (list): List of forecast DataFrames, each with 'forecast_made_on'.
+        y_full (pd.Series): Full actual time series.
+        initial_train_end_date (pd.Timestamp): End date of the initial training set.
+        simulation_end_date (pd.Timestamp): Last date for which a forecast was made.
+        forecast_horizon (int): Horizon length used for forecasts.
+        forecast_sums (dict, optional): Dictionary {forecast_date: sum_of_forecast_horizon}.
+        monthly_sums (dict, optional): Dictionary {forecast_date: monthly_actual_plus_forecast_sum}.
+        log_transform (bool): Whether inverse log transform is needed.
+        show (bool): Whether to display the plot immediately.
+
+    Returns:
+        matplotlib.figure.Figure: The figure object, or None if no forecasts.
+    """
+    if not all_forecasts_list:
+        print("  No forecast results to plot.")
+        return None
+
+    # Determine plot range
     plot_start_date = initial_train_end_date - timedelta(days=60) # Show some history
-    plot_end_date = simulation_end_date + timedelta(days=forecast_horizon)
+    # Find the latest date across all forecasts
+    max_forecast_ds = max(df['ds'].max() for df in all_forecasts_list) if all_forecasts_list else simulation_end_date
+    actuals_plot_end_date = max(simulation_end_date + timedelta(days=1), max_forecast_ds) # Ensure plot covers full range of actuals/forecasts
 
-    # Plot actual data
-    actuals_to_plot = y_full[(y_full.index >= plot_start_date) & (y_full.index <= plot_end_date)]
-    ax1.plot(actuals_to_plot.index, actuals_to_plot.values, label='Actual Sales', color=DEFAULT_COLOR_ACTUAL, linewidth=1.0, zorder=5)
+    # --- MODIFIED: Calculate the end of the month for the simulation end date for x-axis limit ---
+    plot_end_date_limit = simulation_end_date + MonthEnd(0)
+    print(f"DEBUG: Setting plot x-axis limit to end of simulation month: {plot_end_date_limit.date()}")
+    # --- END MODIFIED ---
 
-    # Plot each forecast generated during the simulation
+    # Create figure with 3 subplots, sharing the x-axis
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(15, 15), sharex=True, gridspec_kw={'height_ratios': [3, 1, 1]}) # Adjusted figsize and ratios
+
+    # --- Subplot 1: Individual Forecasts vs Actuals ---
+    # Plot actuals up to the maximum forecast date or simulation end
+    actuals_to_plot = y_full[(y_full.index >= plot_start_date) & (y_full.index <= actuals_plot_end_date)]
+    ax1.plot(actuals_to_plot.index, actuals_to_plot.values, label='Actual Sales', color=DEFAULT_COLOR_ACTUAL, linewidth=1.0, zorder=5) # Ensure actuals are on top
+
+    # Plot individual forecasts
     num_forecasts = len(all_forecasts_list)
-    # Use a reversed sequential colormap like 'Blues_r' for dark-to-light gradient
-    # Other options: 'Greens_r', 'Reds_r', 'Purples_r', 'Oranges_r', 'viridis_r'
-    color_map = plt.get_cmap('Oranges') # Changed from 'viridis' to 'Blues'
+    color_map = plt.get_cmap('Oranges') # Or another sequential colormap
+    # Sort by 'forecast_made_on' date before plotting for consistent color gradient
+    all_forecasts_list.sort(key=lambda df: df['forecast_made_on'].iloc[0])
 
-    # Use the list of dataframes for plotting
-    forecast_dates_sorted = sorted(list(forecast_sums.keys())) # Get sorted dates from sums dict keys
-    for i, forecast_date in enumerate(forecast_dates_sorted):
-        # Find the corresponding forecast df in the list
-        forecast_df = next((df for df in all_forecasts_list if df['forecast_made_on'].iloc[0] == forecast_date), None)
-        if forecast_df is None: continue # Skip if somehow missing
-
+    for i, forecast_df in enumerate(all_forecasts_list):
+        forecast_date = forecast_df['forecast_made_on'].iloc[0]
         dates = pd.to_datetime(forecast_df['ds'])
         yhat = forecast_df['yhat'].values
 
         # Inverse transform if necessary
         if log_transform:
-            yhat = np.expm1(yhat)
+            yhat = np.expm1(np.maximum(0, yhat)) # Ensure non-negative
 
         # Normalize index for color map (use 0.2 to 1.0 range for better visibility)
         color_intensity = 0.2 + 0.8 * (i / max(1, num_forecasts - 1))
         color = color_map(color_intensity)
-        label = f'Forecast from {forecast_date.date()}' if i == 0 or i == num_forecasts - 1 else None # Label first and last
-        # Increase zorder slightly to ensure forecasts are above grid but below actuals
-        ax1.plot(dates, yhat, label=label, color=color, alpha=0.8, linewidth=1.0, zorder=3) # Increased alpha and zorder
+        # Label first and last, and maybe one in the middle
+        label = None
+        if i == 0 or i == num_forecasts - 1 or i == num_forecasts // 2:
+             label = f'Forecast from {forecast_date.date()}'
+
+        ax1.plot(dates, yhat, label=label, color=color, alpha=0.8, linewidth=1.0, zorder=3)
 
     # Formatting for Subplot 1
     ax1.axvline(initial_train_end_date, color=DEFAULT_COLOR_STANDARD, linestyle='--', label='Initial Train End', zorder=4)
     ax1.axvline(simulation_end_date, color=DEFAULT_COLOR_STANDARD, linestyle=':', label='Simulation End', zorder=4)
-    ax1.set_title('Individual Forecasts Over Time')
+    ax1.set_title('Individual Forecasts Over Time vs Actuals')
     ax1.set_ylabel('Sales')
-    # ... rest of ax1 formatting ...
-    ax1.legend(loc='upper left', fontsize=8)
     ax1.grid(True, alpha=0.3)
-    ax1.set_xlim(plot_start_date, plot_end_date)
-    ax1.tick_params(axis='x', labelbottom=False) # Hide x-axis labels for top plot
+    # ax1.tick_params(axis='x', labelbottom=False) # Handled by sharex=True
 
-    # --- Subplot 2: Sum of Forecasts ---
+    # --- Subplot 2: Sum of Forecasts (Horizon Sum) ---
     if forecast_sums:
         sum_dates = sorted(forecast_sums.keys())
-        sums = np.array([forecast_sums[d] for d in sum_dates]) # Convert sums to numpy array
-        ax2.plot(sum_dates, sums, marker='o', markersize=8, linestyle='-', linewidth=2.5, color=DEFAULT_COLOR_HIGHLIGHT, label=f'Sum of {forecast_horizon}-day Forecast')
+        sums = np.array([forecast_sums[d] for d in sum_dates])
+        ax2.plot(sum_dates, sums, marker='o', markersize=5, linestyle='-', linewidth=2.0, color=DEFAULT_COLOR_HIGHLIGHT, label=f'Sum of {forecast_horizon}-day Forecast')
 
         # Calculate statistics for the text
         mean_sum = np.mean(sums) if len(sums) > 0 else 0
         std_sum = np.std(sums) if len(sums) > 0 else 0
         std_pct = (std_sum / mean_sum) * 100 if mean_sum != 0 else 0
-
-        # Add text annotation
-        stats_text = f"Std: {std_sum:,.0f} ({std_pct:.1f}%)"
-        ax2.text(0.98, 0.95, stats_text,
-                 transform=ax2.transAxes, fontsize=9, verticalalignment='top', horizontalalignment='right',
-                 bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+        stats_text = f"Mean: {mean_sum:,.0f}\nStd: {std_sum:,.0f} ({std_pct:.1f}%)" # Added Mean
+        ax2.text(0.98, 0.95, stats_text, transform=ax2.transAxes, fontsize=9, verticalalignment='top', horizontalalignment='right', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
 
         # Formatting for Subplot 2
         ax2.set_title(f'Sum of {forecast_horizon}-Day Forecast vs. Forecast Date')
-        ax2.set_xlabel('Date Forecast Was Made')
         ax2.set_ylabel(f'Total Forecasted Sales\n(next {forecast_horizon} days)')
-        ax2.legend(loc='best', fontsize='small')
         ax2.grid(True, alpha=0.3)
-        ax2.set_xlim(sum_dates[0] - timedelta(days=1), sum_dates[-1] + timedelta(days=1)) # Adjust x-limits for sums plot
-        plt.setp(ax2.get_xticklabels(), rotation=30, ha='right') # Correct: Apply rotation to ax2's labels
-
+        # ax2.tick_params(axis='x', labelbottom=False) # Handled by sharex=True
     else:
-        ax2.text(0.5, 0.5, "No forecast sums calculated.", ha='center', va='center', transform=ax2.transAxes)
-        ax2.set_xlabel('Date Forecast Was Made')
+        ax2.text(0.5, 0.5, 'No forecast horizon sums calculated.', horizontalalignment='center', verticalalignment='center', transform=ax2.transAxes)
+        ax2.set_title(f'Sum of {forecast_horizon}-Day Forecast vs. Forecast Date')
 
 
-    # --- Final Adjustments ---
-    plt.tight_layout(rect=[0, 0.03, 1, 0.97]) # Adjust layout to prevent title overlap
+    # --- ADDED: Subplot 3: Monthly Actual + Forecast Sum ---
+    if monthly_sums:
+        month_sum_dates = sorted(monthly_sums.keys())
+        month_sums = np.array([monthly_sums[d] for d in month_sum_dates])
+        ax3.plot(month_sum_dates, month_sums, marker='s', markersize=5, linestyle='-', linewidth=2.0, color=DEFAULT_COLOR_COMPONENT, label='Monthly Total (Actual+Forecast)') # Square marker, blue color
 
-    # Save the plot
-    plot_path = os.path.join(DEFAULT_PLOTS_DIR, f'rolling_forecast_simulation_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png')
-    try:
-        fig.savefig(plot_path)
-        print(f"Rolling forecast plot saved to: {plot_path}")
-    except Exception as e:
-        print(f"ERROR saving rolling forecast plot: {e}")
-    plt.close(fig) # Close the figure after saving
+        # Calculate statistics for the text
+        mean_m_sum = np.mean(month_sums) if len(month_sums) > 0 else 0
+        std_m_sum = np.std(month_sums) if len(month_sums) > 0 else 0
+        std_m_pct = (std_m_sum / mean_m_sum) * 100 if mean_m_sum != 0 else 0
+        m_stats_text = f"Mean: {mean_m_sum:,.0f}\nStd: {std_m_sum:,.0f} ({std_m_pct:.1f}%)"
+        ax3.text(0.98, 0.95, m_stats_text, transform=ax3.transAxes, fontsize=9, verticalalignment='top', horizontalalignment='right', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
 
-    # Return the figure object and the path to the combined CSV
-    return fig, combined_forecast_path
+        # Formatting for Subplot 3
+        ax3.set_title('Estimated Monthly Total (Actual + Forecast) vs. Forecast Date')
+        ax3.set_ylabel('Estimated Total Sales\n(Current Month)')
+        ax3.grid(True, alpha=0.3)
+    else:
+        ax3.text(0.5, 0.5, 'No monthly sums calculated.', horizontalalignment='center', verticalalignment='center', transform=ax3.transAxes)
+        ax3.set_title('Estimated Monthly Total (Actual + Forecast) vs. Forecast Date')
+
+    # --- Final Formatting ---
+    # Set shared x-axis limits and label (only on bottom plot)
+    ax3.set_xlim(plot_start_date, plot_end_date_limit)
+    ax3.set_xlabel('Date')
+
+    # Improve legend handling (place on ax1)
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    lines3, labels3 = ax3.get_legend_handles_labels()
+    # Combine legends - adjust ncol if needed
+    ax1.legend(handles=lines1 + lines2 + lines3, labels=labels1 + labels2 + labels3, loc='upper left', fontsize=8, ncol=3)
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.97]) # Adjust layout slightly for suptitle
+    fig.suptitle(f'Rolling Forecast Simulation ({len(all_forecasts_list)} forecasts, {forecast_horizon}-day horizon)', fontsize=16) # Updated suptitle
+
+    if show:
+        plt.show()
+
+    return fig
 
 # --- Exporting ---
 
-def export_artifacts(results, output_dir=DEFAULT_OUTPUT_DIR):
+def export_artifacts(results, output_dir=DEFAULT_OUTPUT_DIR, log_transform=True):
     """
     Export model, forecast data, and plots.
 
@@ -1620,6 +1751,16 @@ def export_artifacts(results, output_dir=DEFAULT_OUTPUT_DIR):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     paths = {}
 
+    # Columns typically affected by log transform of y in Prophet output
+    cols_to_inverse_transform = [
+        'yhat', 
+        'yhat_lower', 
+        'yhat_upper', 
+        'trend', 
+        'trend_lower', 
+        'trend_upper'
+    ]
+
     # Model
     try:
         model_path = os.path.join(DEFAULT_MODELS_DIR, f'prophet_model_{timestamp}.pkl')
@@ -1632,21 +1773,47 @@ def export_artifacts(results, output_dir=DEFAULT_OUTPUT_DIR):
 
     # Forecast Data
     try:
-        forecast_path = os.path.join(DEFAULT_FORECASTS_DIR, f'forecast_test_{timestamp}.csv')
-        results['forecast_test'].to_csv(forecast_path, index=False)
-        paths['forecast_test'] = forecast_path
-        print(f"  Test forecast saved: {forecast_path}")
-        forecast_path = os.path.join(DEFAULT_FORECASTS_DIR, f'forecast_train_{timestamp}.csv')
-        results['forecast_train'].to_csv(forecast_path, index=False)
-        paths['forecast_train'] = forecast_path
-        print(f"  Train forecast saved: {forecast_path}")
+        # Process forecast_test
+        df_test = results['forecast_test'].copy()
+        if log_transform:
+            print("  Applying inverse transform (expm1) to forecast_test before saving...")
+            for col in cols_to_inverse_transform:
+                if col in df_test.columns:
+                    df_test[col] = np.expm1(df_test[col])
+        forecast_path_test = os.path.join(DEFAULT_FORECASTS_DIR, f'forecast_test_{timestamp}.csv')
+        df_test.to_csv(forecast_path_test, index=False)
+        paths['forecast_test'] = forecast_path_test
+        print(f"  Test forecast saved: {forecast_path_test}")
+
+        # Process forecast_train
+        df_train = results['forecast_train'].copy()
+        if log_transform:
+            print("  Applying inverse transform (expm1) to forecast_train before saving...")
+            for col in cols_to_inverse_transform:
+                if col in df_train.columns:
+                    df_train[col] = np.expm1(df_train[col])
+        forecast_path_train = os.path.join(DEFAULT_FORECASTS_DIR, f'forecast_train_{timestamp}.csv')
+        df_train.to_csv(forecast_path_train, index=False)
+        paths['forecast_train'] = forecast_path_train
+        print(f"  Train forecast saved: {forecast_path_train}")
+
+        # Process forecast_future
         if 'forecast_future' in results and results['forecast_future'] is not None:
+             df_future = results['forecast_future'].copy()
+             if log_transform:
+                 print("  Applying inverse transform (expm1) to forecast_future before saving...")
+                 for col in cols_to_inverse_transform:
+                     if col in df_future.columns:
+                         df_future[col] = np.expm1(df_future[col])
              future_forecast_path = os.path.join(DEFAULT_FORECASTS_DIR, f'forecast_future_{timestamp}.csv')
-             results['forecast_future'].to_csv(future_forecast_path, index=False)
+             df_future.to_csv(future_forecast_path, index=False)
              paths['forecast_future'] = future_forecast_path
              print(f"  Future forecast saved: {future_forecast_path}")
+
     except Exception as e:
         print(f"  ERROR saving forecast data: {e}")
+        import traceback
+        traceback.print_exc() # Print traceback for debugging saving errors
 
     # Plots
     plot_keys = {
@@ -1824,7 +1991,7 @@ def run_prophet_pipeline(
     )
     
     # 12. Export Artifacts
-    export_artifacts(results)
+    export_artifacts(results, output_dir=output_dir, log_transform=log_transform)
 
     print("\n--- Prophet Forecasting Pipeline Finished ---")
     return results
@@ -1857,9 +2024,9 @@ if __name__ == "__main__":
 
     ADD_RECENT_WEEKDAY_DUMMIES = True
 
-    TEST_SIZE = 28
-    FUTURE_PERIODS = 28
-    SIMULATION_DAYS = 28
+    TEST_SIZE = 35
+    FUTURE_PERIODS = 35
+    SIMULATION_DAYS = 31
 
     # Run the pipeline
     pipeline_results = run_prophet_pipeline(
