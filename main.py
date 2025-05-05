@@ -863,7 +863,7 @@ def plot_covariate_evaluation(eval_results, y, X, show=True):
     if show: plt.show()
     return fig
 
-def plot_model_fit(train_forecast, y_full, test_size, log_transform=True, title="Model Fit Diagnostics", show=True):
+def plot_model_fit(train_forecast, y_full, test_size, model, log_transform=True, title="Model Fit Diagnostics", show=True):
     """
     Plot fitted values against actual values to evaluate model fit on training data (6 subplots).
     Adapted from plot_fitted_vs_actuals in the original script.
@@ -949,6 +949,43 @@ def plot_model_fit(train_forecast, y_full, test_size, log_transform=True, title=
     skew = stats.skew(residuals)
     kurtosis = stats.kurtosis(residuals)
 
+    # --- BIC Calculation ---
+    n = len(actuals) # Number of data points
+    k = 0 # Number of parameters (approximation)
+    bic = np.nan
+
+    if n > 0:
+        # Estimate k (number of parameters) - This is an approximation for Prophet
+        k += 1 # Noise variance sigma_obs
+        if model.growth == 'linear':
+            k += 1 # growth rate k
+            k += 1 # offset m
+            k += len(model.changepoints_t) # Number of changepoint deltas
+        # Add seasonality parameters (Fourier terms * 2 for sin/cos)
+        for name, props in model.seasonalities.items():
+            k += 2 * props['fourier_order']
+        # Add regressor parameters
+        k += len(model.extra_regressors)
+        # Add holiday parameters (if using built-in, but we use dummies)
+        # if model.holidays is not None: k += len(model.holidays.columns) -1 # Exclude ds
+
+        # Calculate Residual Sum of Squares (RSS)
+        rss = np.sum(residuals**2)
+
+        # Calculate Log-Likelihood (assuming normal errors)
+        # LL = -n/2 * log(2*pi) - n/2 * log(RSS/n) - n/2
+        if rss > 0: # Avoid log(0)
+            log_likelihood = -n / 2.0 * np.log(2 * np.pi) - n / 2.0 * np.log(rss / n) - n / 2.0
+            # Calculate BIC: k * log(n) - 2 * LL
+            bic = k * np.log(n) - 2 * log_likelihood
+        else: # Handle case of perfect fit (RSS=0), BIC is -inf technically
+            bic = -np.inf
+
+    print(f"  Estimated BIC: {bic:.2f} (n={n}, approx k={k})")
+    # --- End BIC Calculation ---
+
+
+
     # Create a 2x5 grid of subplots - daily plot will span the entire bottom row
     fig = plt.figure(figsize=(24, 12)) # Keep original size
 
@@ -983,7 +1020,7 @@ def plot_model_fit(train_forecast, y_full, test_size, log_transform=True, title=
         correlation = np.corrcoef(actuals, fitted_values)[0, 1]
         r_squared = correlation ** 2 if not np.isnan(correlation) else 0
         mape = calculate_mape(actuals, fitted_values) # Assumes calculate_mape exists
-        stats_text = f"R²: {r_squared:.4f}\nMAPE: {mape:.2f}%" if not np.isnan(mape) else f"R²: {r_squared:.4f}"
+        stats_text = f"R²: {r_squared:.4f}\nMAPE: {mape:.2f}%\nBIC: {bic:,.1f}" if not np.isnan(mape) else f"R²: {r_squared:.4f}\nBIC: {bic:,.1f}"
         ax1.text(0.05, 0.95, stats_text,
                 transform=ax1.transAxes, fontsize=8, verticalalignment='top',
                 bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
@@ -1057,10 +1094,27 @@ def plot_model_fit(train_forecast, y_full, test_size, log_transform=True, title=
     if 'trend' in monthly_df.columns:
         ax3.plot(monthly_df.index, monthly_df['trend'], color=DEFAULT_COLOR_COMPONENT, linewidth=3, alpha=1.0, linestyle='-', label='Trend (Avg)')
     try:
-        monthly_corr = np.corrcoef(monthly_df['actual'].dropna().values, monthly_df['fitted'].dropna().values)[0, 1]
+        # Recalculate monthly residuals for monthly BIC
+        monthly_actuals = monthly_df['actual'].dropna().values
+        monthly_fitted = monthly_df['fitted'].dropna().values
+        monthly_residuals = monthly_actuals - monthly_fitted
+        n_monthly = len(monthly_actuals)
+        bic_monthly = np.nan
+        if n_monthly > 0:
+            rss_monthly = np.sum(monthly_residuals**2)
+            if rss_monthly > 0:
+                ll_monthly = -n_monthly / 2.0 * np.log(2 * np.pi) - n_monthly / 2.0 * np.log(rss_monthly / n_monthly) - n_monthly / 2.0
+                # Use the same k as before, as it's model complexity, not data frequency dependent
+                bic_monthly = k * np.log(n_monthly) - 2 * ll_monthly
+            else:
+                bic_monthly = -np.inf
+
+        monthly_corr = np.corrcoef(monthly_actuals, monthly_fitted)[0, 1]
         monthly_r2 = monthly_corr ** 2 if not np.isnan(monthly_corr) else 0
-        monthly_mape = calculate_mape(monthly_df['actual'].dropna().values, monthly_df['fitted'].dropna().values)
-        monthly_stats = f"Monthly R²: {monthly_r2:.4f}\nMonthly MAPE: {monthly_mape:.2f}%"
+        monthly_mape = calculate_mape(monthly_actuals, monthly_fitted)
+        # --- MODIFIED: Add Monthly BIC to stats text ---
+        monthly_stats = f"Monthly R²: {monthly_r2:.4f}\nMonthly MAPE: {monthly_mape:.2f}%\nMonthly BIC: {bic_monthly:,.1f}"
+        # --- END MODIFIED ---
         ax3.text(0.05, 0.95, monthly_stats,
                 transform=ax3.transAxes, fontsize=8, verticalalignment='top',
                 bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
@@ -1978,6 +2032,7 @@ def run_prophet_pipeline(
         train_forecast=results['forecast_train'], # Use forecast on training data
         y_full=results['y_full'], # Full actuals needed for train/test split inside
         test_size=test_size,
+        model=results['model'],
         log_transform=log_transform,
         title=f"Model Fit Diagnostics (Train Set)", # Add specific title
         show=False # Pipeline controls showing/saving
