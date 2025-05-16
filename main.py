@@ -1875,7 +1875,8 @@ def export_artifacts(results, output_dir=DEFAULT_OUTPUT_DIR, log_transform=True)
         'fig_components': 'components',
         'fig_forecast': 'forecast',
         'fig_regressor_coefficients': 'regressor_coefficients', 
-        'fig_covariate_evaluation': 'covariate_evaluation'
+        'fig_covariate_evaluation': 'covariate_evaluation',
+        'fig_combined_holiday_impact': 'combined_holiday_impact' # ADDED THIS LINE
     }
     for key, name in plot_keys.items():
         if key in results and results[key] is not None:
@@ -1890,6 +1891,268 @@ def export_artifacts(results, output_dir=DEFAULT_OUTPUT_DIR, log_transform=True)
 
     print("Artifact export complete.")
     return paths
+
+
+
+
+
+
+
+
+
+
+
+def plot_combined_holiday_impact(forecast, holiday_regressor_names, y_full=None, log_transform=False, title="Holiday Impact Components Over Time (Last Year)", show=True):
+    """
+    Plot individual and combined impacts of holiday regressors over the last year of the forecast period.
+    Also shows y_full for the same last year period for context.
+
+    Args:
+        forecast (pd.DataFrame): Prophet forecast DataFrame. Must contain 'ds' and
+                                 columns for each holiday regressor component.
+        holiday_regressor_names (list): List of holiday regressor column names
+                                        present in the forecast DataFrame.
+        y_full (pd.Series, optional): The full original target time series for context.
+        log_transform (bool): Whether log transform was applied to the target.
+        title (str): Plot title.
+        show (bool): Whether to display the plot immediately.
+
+    Returns:
+        matplotlib.figure.Figure: The figure object, or None if error.
+    """
+    print("Plotting individual and combined holiday impacts over time (last year)...")
+    if forecast is None or forecast.empty:
+        print("  Forecast DataFrame is empty or None.")
+        return None
+
+    # --- Filter forecast to the last year of data ---
+    original_forecast_dates = pd.to_datetime(forecast['ds'])
+    if original_forecast_dates.empty:
+        print("  Forecast DataFrame has no dates.")
+        return None
+    
+    last_date_in_forecast = original_forecast_dates.max()
+    first_date_for_last_year = last_date_in_forecast - pd.DateOffset(years=1) + pd.Timedelta(days=1)
+    
+    forecast_last_year = forecast[original_forecast_dates >= first_date_for_last_year].copy()
+    
+    if forecast_last_year.empty:
+        print(f"  No forecast data found within the last year (from {first_date_for_last_year.date()} to {last_date_in_forecast.date()}).")
+        return None
+    print(f"  Filtered forecast to last year: {forecast_last_year['ds'].min()} to {forecast_last_year['ds'].max()}")
+    # --- End filter ---
+
+    # Use the filtered forecast DataFrame from now on
+    current_forecast_df = forecast_last_year
+
+    relevant_holiday_cols = [col for col in holiday_regressor_names if col in current_forecast_df.columns]
+
+    if not relevant_holiday_cols:
+        print("  No specified holiday regressor components found in the filtered forecast DataFrame.")
+        return None
+
+    print(f"  Plotting effects for {len(relevant_holiday_cols)} holiday regressors.")
+    combined_holiday_effect = current_forecast_df[relevant_holiday_cols].sum(axis=1)
+
+    fig, ax1 = plt.subplots(figsize=(15, 8))
+    dates_for_ax1 = pd.to_datetime(current_forecast_df['ds']) # Dates are now from the last year
+
+    plot_ylabel = "Holiday Impact Component Value"
+    if log_transform:
+        plot_ylabel += " (on Log Scale of y)"
+
+    num_holidays = len(relevant_holiday_cols)
+    color_map_individual = plt.colormaps.get_cmap('turbo')
+
+    for i, holiday_col in enumerate(relevant_holiday_cols):
+        clean_label = holiday_col.replace('_dummy', '').replace('recent_', '').replace('_', ' ').title()
+        color_sample_point = i / max(1, num_holidays - 1) if num_holidays > 1 else 0.5
+        ax1.plot(dates_for_ax1, current_forecast_df[holiday_col].values,
+                 color=color_map_individual(color_sample_point),
+                 label=clean_label,
+                 linewidth=0.9, alpha=0.75)
+
+    ax1.plot(dates_for_ax1, combined_holiday_effect.values, color='black', label='Combined Holiday Impact', linewidth=1.0, linestyle='-')
+
+    ax1.set_xlabel('Date')
+    ax1.set_ylabel(plot_ylabel)
+    ax1.tick_params(axis='y')
+    ax1.grid(True, alpha=0.3, linestyle='-')
+    ax1.axhline(0, color='dimgray', linestyle='-', alpha=0.7, linewidth=1.0)
+
+    ax2 = None
+    lines, labels = ax1.get_legend_handles_labels()
+    all_lines = lines
+    all_labels = labels
+
+    if y_full is not None and not dates_for_ax1.empty: # dates_for_ax1 is already last year
+        ax2 = ax1.twinx()
+        
+        # Filter y_full to the same "last year" window as dates_for_ax1
+        # (first_date_for_last_year and last_date_in_forecast are from the initial forecast filtering)
+        y_full_last_year_segment_original_index = y_full[
+            (y_full.index >= first_date_for_last_year) &
+            (y_full.index <= last_date_in_forecast) # Use the overall last date from original forecast
+        ]
+        
+        # Reindex this segment to the specific dates present in dates_for_ax1 (which is already last year)
+        target_reindex_dtindex = pd.DatetimeIndex(dates_for_ax1.unique())
+        
+        y_full_aligned_for_plot = y_full_last_year_segment_original_index.reindex(target_reindex_dtindex).interpolate(method='time')
+        
+        valid_y_values_in_segment_mask = ~y_full_aligned_for_plot.isna()
+        dates_to_plot_for_y_full = y_full_aligned_for_plot.index[valid_y_values_in_segment_mask]
+        values_to_plot_for_y_full = y_full_aligned_for_plot[valid_y_values_in_segment_mask].values
+
+        if not dates_to_plot_for_y_full.empty:
+            ax2.plot(dates_to_plot_for_y_full, values_to_plot_for_y_full,
+                     color=DEFAULT_COLOR_ACTUAL, alpha=0.5,
+                     label='Actual Sales (Last Year, Context)', linestyle='-', linewidth=1.0)
+            ax2.set_ylabel('Target Value (Context)', color=DEFAULT_COLOR_ACTUAL, alpha=0.7)
+            ax2.tick_params(axis='y', labelcolor=DEFAULT_COLOR_ACTUAL)
+            
+            lines2, labels2 = ax2.get_legend_handles_labels()
+            all_lines.extend(lines2) # Use extend for lists
+            all_labels.extend(labels2)
+        else:
+            print("  Warning: No y_full data available for the last year of the displayed forecast period after alignment.")
+            if ax2:
+                ax2.set_frame_on(False)
+                ax2.set_yticks([])
+                ax2.set_yticklabels([])
+    
+    # if len(all_labels) > 0:
+    #     if len(all_labels) > 15:
+    #         ax1.legend(all_lines, all_labels, loc='upper left', bbox_to_anchor=(1.03, 1), borderaxespad=0., fontsize=7)
+    #         plt.subplots_adjust(right=0.70 if len(all_labels) > 30 else 0.75)
+    #     elif len(all_labels) > 8:
+    #          ax1.legend(all_lines, all_labels, loc='best', fontsize=7)
+    #     else:
+    #         ax1.legend(all_lines, all_labels, loc='best', fontsize=9)
+
+    ax1.set_title(title, fontsize=14) # Title updated to reflect "Last Year"
+    fig.autofmt_xdate() 
+
+    if not (len(all_labels) > 15):
+        try:
+            plt.tight_layout()
+        except ValueError: 
+            print("  Warning: tight_layout() failed. Plot might have overlapping elements.")
+
+    if show:
+        plt.show()
+    return fig
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# def plot_combined_holiday_impact(forecast, holiday_regressor_names, y_full=None, log_transform=False, title="Combined Holiday Impact Over Time", show=True):
+#     """
+#     Plot the combined impact of specified holiday regressors over time.
+#     The impact is the sum of individual regressor components (beta_i * regressor_i(t)).
+
+#     Args:
+#         forecast (pd.DataFrame): Prophet forecast DataFrame. Must contain 'ds' and
+#                                  columns for each holiday regressor component.
+#         holiday_regressor_names (list): List of holiday regressor column names
+#                                         present in the forecast DataFrame.
+#         y_full (pd.Series, optional): The full original target time series for context.
+#         log_transform (bool): Whether log transform was applied to the target.
+#                               If True, the holiday impact is on the log scale of y.
+#         title (str): Plot title.
+#         show (bool): Whether to display the plot immediately.
+
+#     Returns:
+#         matplotlib.figure.Figure: The figure object, or None if error.
+#     """
+#     print("Plotting combined holiday impact over time...")
+#     if forecast is None or forecast.empty:
+#         print("  Forecast DataFrame is empty or None.")
+#         return None
+
+#     # Filter to holiday regressors actually present in the forecast output
+#     relevant_holiday_cols = [col for col in holiday_regressor_names if col in forecast.columns]
+
+#     if not relevant_holiday_cols:
+#         print("  No specified holiday regressor components found in forecast DataFrame.")
+#         # print(f"    Available forecast columns: {forecast.columns.tolist()}")
+#         # print(f"    Expected holiday regressors: {holiday_regressor_names}")
+#         return None
+
+#     print(f"  Summing effects for {len(relevant_holiday_cols)} holiday regressors.")
+#     # Sum the contributions of each holiday regressor component
+#     # Each column [reg_name] in forecast is already beta_i * regressor_i(t)
+#     combined_holiday_effect = forecast[relevant_holiday_cols].sum(axis=1)
+
+#     fig, ax1 = plt.subplots(figsize=(15, 7)) # Increased width slightly
+#     dates = pd.to_datetime(forecast['ds'])
+
+#     plot_ylabel = "Combined Holiday Impact"
+#     if log_transform:
+#         plot_ylabel += " (on Log Scale of y)"
+
+#     ax1.plot(dates, combined_holiday_effect.values, color=DEFAULT_COLOR_COMPONENT, label='Combined Holiday Impact', linewidth=1.5)
+#     ax1.set_xlabel('Date')
+#     ax1.set_ylabel(plot_ylabel, color=DEFAULT_COLOR_COMPONENT)
+#     ax1.tick_params(axis='y', labelcolor=DEFAULT_COLOR_COMPONENT)
+#     ax1.grid(True, alpha=0.4, linestyle='--')
+#     ax1.axhline(0, color='black', linestyle='-', alpha=0.7, linewidth=0.8) # Make zero line more prominent
+
+#     # Add markers for significant positive/negative impact days (optional)
+#     # threshold = combined_holiday_effect.abs().quantile(0.9) # Example: top 10% absolute impact
+#     # significant_positive = combined_holiday_effect > threshold
+#     # significant_negative = combined_holiday_effect < -threshold
+#     # if threshold > 0:
+#     #     ax1.plot(dates[significant_positive], combined_holiday_effect[significant_positive], 'o', color='green', markersize=5, label='Strong Positive Impact')
+#     #     ax1.plot(dates[significant_negative], combined_holiday_effect[significant_negative], 'o', color='red', markersize=5, label='Strong Negative Impact')
+
+
+#     if y_full is not None:
+#         ax2 = ax1.twinx()
+#         # Align y_full with the forecast dates for plotting context
+#         # Using interpolate and fillna for robustness
+#         y_full_aligned = y_full.reindex(dates).interpolate(method='time').fillna(method='ffill').fillna(method='bfill')
+
+
+#         actual_label = 'Actual Sales (Context)'
+#         # if log_transform:
+#         #     actual_label = 'Actual Sales (Original Scale, Context)' # y_full is original scale
+
+#         ax2.plot(dates, y_full_aligned.values, color=DEFAULT_COLOR_ACTUAL, alpha=0.4, label=actual_label, linestyle=':', linewidth=1.0)
+#         ax2.set_ylabel('Target Value (Context)', color=DEFAULT_COLOR_ACTUAL, alpha=0.6)
+#         ax2.tick_params(axis='y', labelcolor=DEFAULT_COLOR_ACTUAL) # Removed alpha=0.6
+#         lines, labels = ax1.get_legend_handles_labels()
+#         lines2, labels2 = ax2.get_legend_handles_labels()
+#         ax1.legend(lines + lines2, labels + labels2, loc='upper left', fontsize=9)
+#     else:
+#         ax1.legend(loc='upper left', fontsize=9)
+
+#     ax1.set_title(title, fontsize=14)
+#     fig.autofmt_xdate()
+#     plt.tight_layout()
+
+#     if show:
+#         plt.show()
+#     return fig
+
+
+
+
+
+
+
 
 # --- Main Pipeline Orchestrator ---
 
@@ -2005,6 +2268,51 @@ def run_prophet_pipeline(
     train_future_df = train_df[['ds'] + regressor_cols].copy()
     forecast_train = make_predictions(model, train_future_df)
     results['forecast_train'] = forecast_train
+
+
+
+
+
+
+
+    # --- ADDED: Generate plot for combined holiday impact ---
+    all_potential_holiday_dummy_names = []
+    if all_date_dummies: # all_date_dummies is from results['date_dummies']
+        all_potential_holiday_dummy_names.extend([
+            spec['name'] for spec in all_date_dummies if isinstance(spec, dict) and 'name' in spec
+        ])
+    if add_recent_weekday_dummies: # This is a parameter of run_prophet_pipeline
+        for weekday_idx in range(7):
+            all_potential_holiday_dummy_names.append(f'recent_{calendar.day_name[weekday_idx].lower()}_dummy')
+
+    # Filter these names to only those actually used as regressors in the model
+    holiday_regressors_in_model = [
+        name for name in all_potential_holiday_dummy_names
+        if name in model.extra_regressors.keys() # model.extra_regressors has the actual regressors
+    ]
+    results['fig_combined_holiday_impact'] = None # Initialize
+    if holiday_regressors_in_model:
+        print(f"\nGenerating combined holiday impact plot for {len(holiday_regressors_in_model)} holiday regressors...")
+        results['fig_combined_holiday_impact'] = plot_combined_holiday_impact(
+            forecast=results['forecast_train'], # Use train forecast as it covers historical period
+            holiday_regressor_names=holiday_regressors_in_model,
+            y_full=results['y_full'], # Original scale y for context
+            log_transform=log_transform, # Pass the pipeline's log_transform flag
+            title="Combined Holiday Dummies Impact (Train Period)",
+            show=False # Pipeline controls showing/saving
+        )
+    else:
+        print("\nNo holiday dummy regressors identified in the model for impact plot.")
+    # --- END ADDED ---
+
+
+
+
+
+
+
+
+
 
     # 9. Make Predictions (Future Period)
     results['forecast_future'] = None
