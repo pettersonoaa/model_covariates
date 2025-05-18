@@ -13,11 +13,12 @@ Functions:
 from datetime import date, timedelta, datetime
 from dateutil.easter import easter
 import pandas as pd
+import numpy as np
 
 def calendar_events_features(start_date=None,
                              end_date=None, 
                              weekdays: bool = True, 
-                             workingdays: bool = True,
+                             workingdays: bool = False,
                              lags: int = None, 
                              leads: int = None,
                              slope_coef: int = 0,
@@ -275,7 +276,7 @@ def calendar_seasonal_features(start_date=None,
     data = data.set_index('date')   
 
     # One-hot encode categorical features
-    data = pd.get_dummies(data=data, drop_first=drop_first)
+    data = pd.get_dummies(data=data, drop_first=drop_first).astype(np.float32)
 
     # add a column for drift_date if provided: 1.0 if date >= drift_date, else 0.0
     if drift_date:
