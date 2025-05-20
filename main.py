@@ -1622,7 +1622,26 @@ def export_artifacts(results, output_dir=DEFAULT_OUTPUT_DIR, log_transform=True)
         'fig_forecast': 'forecast',
         'fig_regressor_coefficients': 'regressor_coefficients', 
         'fig_covariate_evaluation': 'covariate_evaluation',
-        'fig_combined_holiday_impact': 'combined_holiday_impact' # ADDED THIS LINE
+        'fig_combined_holiday_impact': 'combined_holiday_impact',
+
+
+
+
+
+
+
+        'fig_monthly_forecast': 'monthly_forecast',
+
+
+
+
+
+
+
+
+
+
+        
     }
     for key, name in plot_keys.items():
         if key in results and results[key] is not None:
@@ -1637,6 +1656,300 @@ def export_artifacts(results, output_dir=DEFAULT_OUTPUT_DIR, log_transform=True)
 
     print("Artifact export complete.")
     return paths
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def plot_monthly_actuals_and_forecast(
+    actuals_daily_series: pd.Series, 
+    forecast_daily_df: pd.DataFrame, 
+    log_transform: bool = True, 
+    history_days_to_show: int = 365*3, 
+    title: str = "Actuals and forecast for long time period", 
+    show: bool = True
+):
+    # Create figure with two subplots (monthly on left, annual on right)
+    fig = plt.figure(figsize=(20, 8))
+    gs = GridSpec(1, 2, figure=fig, width_ratios=[1.5, 1])
+    ax = fig.add_subplot(gs[0, 0])      # Monthly subplot (left)
+    ax_annual = fig.add_subplot(gs[0, 1])  # Annual subplot (right)
+
+    # --- 1. Prepare Data ---
+    last_actual_date_month_end = None
+    actuals_monthly_history_to_plot = pd.Series(dtype=float, index=pd.DatetimeIndex([]))
+    
+    # Prophet forecast components (daily)
+    fcst_ds = pd.to_datetime(forecast_daily_df['ds'])
+    yhat_daily_values = forecast_daily_df['yhat'].copy()
+    
+    if log_transform:
+        yhat_daily_values = np.expm1(yhat_daily_values)
+        
+    yhat_daily_series_full = pd.Series(yhat_daily_values.values, index=fcst_ds)
+    
+    # Monthly Actuals
+    if actuals_daily_series is not None and not actuals_daily_series.empty:
+        if not isinstance(actuals_daily_series.index, pd.DatetimeIndex):
+            print("ERROR: actuals_daily_series must have a DatetimeIndex.")
+            return fig
+        
+        actuals_monthly_all = actuals_daily_series.resample('ME').sum()
+        if not actuals_monthly_all.empty:
+            last_actual_date_month_end = actuals_monthly_all.index[-1]
+            
+            num_history_months = max(1, int(history_days_to_show / 30.44))
+            if len(actuals_monthly_all) > num_history_months:
+                actuals_monthly_history_to_plot = actuals_monthly_all.iloc[-num_history_months:]
+            else:
+                actuals_monthly_history_to_plot = actuals_monthly_all
+    else:
+        print("Warning: Actuals data is empty or None. Plotting forecast and trend only.")
+
+    # --- 2. Create Combined Actuals/Forecast Line (Monthly) ---
+    combined_line_monthly = pd.Series(dtype=float)
+    if not actuals_monthly_history_to_plot.empty:
+        combined_line_monthly = actuals_monthly_history_to_plot.copy()
+
+    # Forecast part of the combined line
+    yhat_future_monthly_for_combined_line = pd.Series(dtype=float, index=pd.DatetimeIndex([]))
+    if last_actual_date_month_end:
+        yhat_future_daily_for_combined = yhat_daily_series_full[yhat_daily_series_full.index > last_actual_date_month_end]
+        if not yhat_future_daily_for_combined.empty:
+            yhat_future_monthly_for_combined_line = yhat_future_daily_for_combined.resample('ME').sum()
+            # Append to combined_line_monthly, ensuring no overlap and correct order
+            combined_line_monthly = pd.concat([
+                combined_line_monthly[combined_line_monthly.index < yhat_future_monthly_for_combined_line.index.min()], 
+                yhat_future_monthly_for_combined_line
+            ]).sort_index()
+    elif not yhat_daily_series_full.empty: # No actuals, plot full yhat as the main line
+        combined_line_monthly = yhat_daily_series_full.resample('ME').sum()
+        # Apply history cutoff if applicable to the forecast itself
+        num_history_months = max(1, int(history_days_to_show / 30.44))
+        if len(combined_line_monthly) > num_history_months:
+             combined_line_monthly = combined_line_monthly.iloc[-num_history_months:]
+
+    # --- 3. Prepare Annual Data (for the new subplot) ---
+    # Get annual aggregates from the same data
+    actuals_annual = None
+    forecast_annual = None
+    
+    if actuals_daily_series is not None and not actuals_daily_series.empty:
+        actuals_annual = actuals_daily_series.resample('YE').sum()
+    
+    if not yhat_daily_series_full.empty:
+        forecast_annual = yhat_daily_series_full.resample('YE').sum()
+    
+    # Determine which years to show for actuals and forecast
+    annual_years = set()
+    if actuals_annual is not None and not actuals_annual.empty:
+        annual_years.update([date.year for date in actuals_annual.index])
+    
+    if forecast_annual is not None and not forecast_annual.empty:
+        forecast_years = [date.year for date in forecast_annual.index]
+        annual_years.update(forecast_years)
+    
+    # --- 4. Plotting Monthly Subplot (left) ---
+    split_actuals = combined_line_monthly[combined_line_monthly.index <= last_actual_date_month_end] if last_actual_date_month_end else None
+    split_forecast = combined_line_monthly[combined_line_monthly.index >= last_actual_date_month_end] if last_actual_date_month_end else None
+    if not combined_line_monthly.empty:
+        ax.plot(split_actuals.index, split_actuals.values, 
+                label='Actuals (Monthly Sum)', color=DEFAULT_COLOR_ACTUAL, linestyle='-', linewidth=2.5)
+        ax.plot(split_forecast.index, split_forecast.values, 
+                label='Forecast (Monthly Sum)', color=DEFAULT_COLOR_FORECAST, linestyle='-', linewidth=2.5)
+        
+    # Vertical separator line
+    if last_actual_date_month_end:
+        ax.axvline(last_actual_date_month_end, color=DEFAULT_COLOR_ACTUAL, linestyle='--', linewidth=1.0, alpha=0.5, label='Actuals/Forecast Split')
+
+    # --- 5. Monthly Subplot Formatting ---
+    ax.set_xlabel('Date (Month End)')
+    ax.set_ylabel('Value (Monthly Sum)')
+    ax.set_title('Monthly Aggregation')
+    ax.legend(loc='upper left')
+    ax.grid(True, alpha=0.4, linestyle='--')
+    
+    # Determine overall date range for x-axis ticks and limits
+    all_plotted_dates_for_ticks = []
+    if not combined_line_monthly.empty: all_plotted_dates_for_ticks.extend(combined_line_monthly.index)
+
+    if all_plotted_dates_for_ticks:
+        # Ensure unique, sorted dates
+        unique_dates = sorted(list(set(pd.Timestamp(date) for date in all_plotted_dates_for_ticks)))
+        if unique_dates:
+            ax.xaxis.set_major_locator(mdates.MonthLocator(interval=max(1, len(unique_dates) // 12)))
+            
+            # Set x-limits to the start of the first month and end of the last month
+            min_date_overall = unique_dates[0]
+            max_date_overall = unique_dates[-1]
+            plot_xlim_start = min_date_overall.to_period('M').start_time - pd.Timedelta(days=1)
+            plot_xlim_end = max_date_overall.to_period('M').end_time + pd.Timedelta(days=1)
+            ax.set_xlim(plot_xlim_start, plot_xlim_end)
+
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+    plt.setp(ax.get_xticklabels(), rotation=30, ha='right')
+    
+    # --- 6. Plotting Annual Subplot (right) ---
+    # Check if the last forecast year is a full year
+    has_partial_year = False
+    last_year = None
+    
+    if forecast_annual is not None and not forecast_annual.empty:
+        forecast_end_date = yhat_daily_series_full.index.max()
+        last_year = forecast_end_date.year
+        year_end_date = pd.Timestamp(f"{last_year}-12-31")
+        
+        # If the forecast doesn't go through December 31st of the last year, it's partial
+        if forecast_end_date < year_end_date:
+            has_partial_year = True
+            print(f"Last year ({last_year}) is partial, ending on {forecast_end_date.date()} instead of {year_end_date.date()}. Excluding from annual plot.")
+    
+    # Sort years for consistent ordering and filter out partial year if needed
+    sorted_years = sorted(annual_years)
+    if has_partial_year and last_year in sorted_years:
+        sorted_years.remove(last_year)
+    
+    annual_values = []
+    annual_colors = []
+    annual_sources = []  # To track the source of data for each year (actuals, forecast, or combined)
+    
+    # For each year, sum actuals and forecast values together
+    for year in sorted_years:
+        year_total = 0
+        has_actuals = False
+        has_forecast = False
+        
+        # Add actuals for this year if available
+        if actuals_annual is not None and not actuals_annual.empty:
+            year_matches = [i for i, date in enumerate(actuals_annual.index) if date.year == year]
+            if year_matches:
+                year_total += actuals_annual.iloc[year_matches[0]]
+                has_actuals = True
+        
+        # Add forecasts for this year if available
+        if forecast_annual is not None and not forecast_annual.empty:
+            year_matches = [i for i, date in enumerate(forecast_annual.index) if date.year == year]
+            if year_matches:
+                # For years with actuals, we only want to add forecast values not covered by actuals
+                if has_actuals and last_actual_date_month_end:
+                    # Get the last day of actuals for this year
+                    year_last_actual = pd.Timestamp(year=year, month=12, day=31)
+                    if year_last_actual > last_actual_date_month_end:
+                        # Get daily forecast values after the last actual date
+                        forecast_days = yhat_daily_series_full[
+                            (yhat_daily_series_full.index > last_actual_date_month_end) & 
+                            (yhat_daily_series_full.index.year == year)
+                        ]
+                        # Sum these forecast values and add to the total
+                        if not forecast_days.empty:
+                            year_total += forecast_days.sum()
+                            has_forecast = True
+                else:
+                    # If no actuals for this year, use the full forecast
+                    year_total += forecast_annual.iloc[year_matches[0]]
+                    has_forecast = True
+        
+        annual_values.append(year_total)
+        
+        # Determine color based on data sources
+        if has_actuals and has_forecast:
+            annual_colors.append(DEFAULT_COLOR_PREDICTED) 
+            annual_sources.append('combined')
+        elif has_actuals:
+            annual_colors.append(DEFAULT_COLOR_ACTUAL)
+            annual_sources.append('actual')
+        elif has_forecast:
+            annual_colors.append(DEFAULT_COLOR_FORECAST)
+            annual_sources.append('forecast')
+        else:
+            annual_colors.append('lightgray')
+            annual_sources.append('none')
+    
+    # Create the barplot
+    if sorted_years:
+        bars = ax_annual.bar(sorted_years, annual_values, color=annual_colors, alpha=0.8)
+        
+        # Add value labels on top of each bar with YoY variation
+        for i, (bar, value) in enumerate(zip(bars, annual_values)):
+            height = bar.get_height()
+            
+            # Calculate year-over-year variation
+            yoy_text = ""
+            if i > 0:  # Skip for the first year as there's no previous year to compare
+                prev_value = annual_values[i-1]
+                if prev_value > 0:  # Avoid division by zero
+                    yoy_pct = ((value - prev_value) / prev_value) * 100
+                    sign = "+" if yoy_pct >= 0 else ""
+                    yoy_text = f"\n{sign}{yoy_pct:.1f}% YoY"
+            
+            # Display value and YoY variation
+            ax_annual.text(bar.get_x() + bar.get_width()/2., height + (max(annual_values) * 0.02),
+                    f'{int(value):,}{yoy_text}', ha='center', va='bottom', rotation=0, fontsize=9)
+        
+        # Formatting for annual subplot
+        ax_annual.set_xlabel('Year')
+        ax_annual.set_ylabel('Annual Total')
+        ax_annual.set_title('Annual Aggregation')
+        ax_annual.grid(True, alpha=0.3, axis='y')
+        
+        # Create a custom legend for the annual subplot
+        from matplotlib.patches import Patch
+        legend_elements = [
+            Patch(facecolor=DEFAULT_COLOR_ACTUAL, label='Actual Only'),
+            Patch(facecolor=DEFAULT_COLOR_FORECAST, label='Forecast Only'),
+            Patch(facecolor=DEFAULT_COLOR_PREDICTED, label='Actual + Forecast')
+        ]
+        ax_annual.legend(handles=legend_elements, loc='upper left')
+        
+        # Ensure integer ticks for years and proper spacing
+        ax_annual.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
+        
+        # Adjust y-axis limits to leave room for value labels (increased to accommodate YoY labels)
+        ax_annual.set_ylim(0, max(annual_values) * 1.25)
+        
+    else:
+        ax_annual.text(0.5, 0.5, "No annual data available", 
+                      horizontalalignment='center', verticalalignment='center', 
+                      transform=ax_annual.transAxes)
+    
+    # --- 7. Finalize plot ---
+    fig.suptitle(title, fontsize=16)
+    plt.tight_layout()
+    
+    if show:
+        plt.show()
+    return fig
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 # --- Main Pipeline Orchestrator ---
@@ -1769,6 +2082,32 @@ def run_prophet_pipeline(
         title="Combined Holiday Dummies Impact (Train Period)",
         show=False # Pipeline controls showing/saving
     )
+
+
+
+
+
+
+
+
+
+    results['fig_monthly_forecast'] = plot_monthly_actuals_and_forecast(
+        actuals_daily_series=results['y_full'], # Original scale y for context
+        forecast_daily_df=results['forecast_future'], # Use future forecast for monthly plot
+        log_transform=log_transform, # Pass the pipeline's log_transform flag
+        show=False # Pipeline controls showing/saving
+    )
+
+
+
+
+
+
+
+
+
+
+
     
     # 12. Export Artifacts
     export_artifacts(results, output_dir=output_dir, log_transform=log_transform)
@@ -1803,7 +2142,7 @@ if __name__ == "__main__":
     ]
 
     TEST_SIZE = 180
-    FUTURE_PERIODS = 190
+    FUTURE_PERIODS = 365 * 3
     SIMULATION_DAYS = 3
 
     # Run the pipeline
