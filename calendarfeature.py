@@ -116,7 +116,7 @@ def calendar_events_features(start_date=None,
     easter_events = [event for event in EVENTS['easter_based_events'] if event['name'] in event_names] if event_names else EVENTS['easter_based_events']
     for holiday in easter_events:
         data['calendar_moving_event_' + holiday['name']] = data['date'].apply(
-            lambda x: pulse_value(x.year) if (x == (easter(x.year) + timedelta(days=holiday['delta_days']))) else 0.0
+            lambda x: pulse_value(x.year) if (x.date() == (easter(x.year) + timedelta(days=holiday['delta_days']))) else 0.0
         )
     
     # Add special holidays to DataFrame
@@ -128,7 +128,7 @@ def calendar_events_features(start_date=None,
         return first_weekday + timedelta(days=delta_days)   
     for event in special_events:
         data['calendar_moving_event_' + event['name']] = data['date'].apply(
-            lambda x: pulse_value(x.year) if (x == (day_of_special_event(x.year, event['month'], event['weekday'], event['delta_days']))) else 0.0
+            lambda x: pulse_value(x.year) if (x.date() == (day_of_special_event(x.year, event['month'], event['weekday'], event['delta_days']))) else 0.0
         )
 
     columns_by_events_types['moving_events'] = [col for col in data.columns.to_list() if col not in columns_by_events_types['fixed_events'] and col != 'date']
@@ -194,7 +194,7 @@ def calendar_events_features(start_date=None,
         for lead in range(1, leads + 1):
             leaded_data_columns = columns_by_events_types['fixed_events'] + columns_by_events_types['moving_events'] + columns_by_events_types['fixed_events_per_weekday'] + columns_by_events_types['workingdays']
             leaded_data = data[leaded_data_columns].copy()
-            leaded_data = leaded_data.shift(lead)
+            leaded_data = leaded_data.shift(-lead)
             leaded_data.columns = [f"{col}_pos{lead}" for col in leaded_data.columns]
             data = data.merge(leaded_data, on='date', how='left')
             columns_by_events_types['events_leads'] += leaded_data.columns.to_list()
