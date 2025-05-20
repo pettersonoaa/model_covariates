@@ -1641,7 +1641,7 @@ def export_artifacts(results, output_dir=DEFAULT_OUTPUT_DIR, log_transform=True)
 
 
 
-        
+
     }
     for key, name in plot_keys.items():
         if key in results and results[key] is not None:
@@ -1675,7 +1675,6 @@ def plot_monthly_actuals_and_forecast(
     actuals_daily_series: pd.Series, 
     forecast_daily_df: pd.DataFrame, 
     log_transform: bool = True, 
-    history_days_to_show: int = 365*3, 
     title: str = "Actuals and forecast for long time period", 
     show: bool = True
 ):
@@ -1707,12 +1706,7 @@ def plot_monthly_actuals_and_forecast(
         actuals_monthly_all = actuals_daily_series.resample('ME').sum()
         if not actuals_monthly_all.empty:
             last_actual_date_month_end = actuals_monthly_all.index[-1]
-            
-            num_history_months = max(1, int(history_days_to_show / 30.44))
-            if len(actuals_monthly_all) > num_history_months:
-                actuals_monthly_history_to_plot = actuals_monthly_all.iloc[-num_history_months:]
-            else:
-                actuals_monthly_history_to_plot = actuals_monthly_all
+            actuals_monthly_history_to_plot = actuals_monthly_all
     else:
         print("Warning: Actuals data is empty or None. Plotting forecast and trend only.")
 
@@ -1734,10 +1728,6 @@ def plot_monthly_actuals_and_forecast(
             ]).sort_index()
     elif not yhat_daily_series_full.empty: # No actuals, plot full yhat as the main line
         combined_line_monthly = yhat_daily_series_full.resample('ME').sum()
-        # Apply history cutoff if applicable to the forecast itself
-        num_history_months = max(1, int(history_days_to_show / 30.44))
-        if len(combined_line_monthly) > num_history_months:
-             combined_line_monthly = combined_line_monthly.iloc[-num_history_months:]
 
     # --- 3. Prepare Annual Data (for the new subplot) ---
     # Get annual aggregates from the same data
@@ -1971,7 +1961,21 @@ def run_prophet_pipeline(
     perform_covariate_evaluation=True,
     max_lag_for_evaluation=70,
     output_dir=DEFAULT_OUTPUT_DIR,
-    covariate_forecasting=True
+    covariate_forecasting=True,
+
+
+
+
+
+    feature_selection=False,
+    coefficient_threshold=0.1
+
+
+
+
+
+
+
 ):
     print("\n--- Starting Prophet Forecasting Pipeline ---")
     results = {}
@@ -2023,10 +2027,21 @@ def run_prophet_pipeline(
     test_df = prophet_df[-test_size-future_periods:-future_periods][['ds', 'y'] + regressor_cols].copy() 
     forecast_df = prophet_df[-future_periods:][['ds'] + regressor_cols].copy() 
 
-    # 6. Train Model
 
+
+
+
+
+
+
+
+
+
+
+
+    # 6. Train Initial Model
     print("Initializing Prophet model...")
-    model = Prophet(
+    initial_model = Prophet(
         yearly_seasonality=yearly_seasonality,
         weekly_seasonality=weekly_seasonality,
         daily_seasonality=daily_seasonality,
@@ -2034,15 +2049,68 @@ def run_prophet_pipeline(
     )
 
     if regressor_cols:
-        print(f"  Adding {len(regressor_cols)} regressors...")
+        print(f"  Adding {len(regressor_cols)} regressors to initial model...")
         for col in regressor_cols:
-            model.add_regressor(col)
+            initial_model.add_regressor(col)
 
-    print("Fitting Prophet model...")
-    model.fit(train_df)
-    print("Model fitting complete.")
+    print("Fitting initial Prophet model...")
+    initial_model.fit(train_df)
+    print("Initial model fitting complete.")
+    
+    # Feature Selection based on coefficient values if requested
+    if feature_selection and regressor_cols:
+        print(f"\n--- Performing Feature Selection (coefficient threshold: {coefficient_threshold}) ---")
+        # Get regressor coefficients
+        coef_df = regressor_coefficients(initial_model)
+        
+        # Select regressors with absolute coefficient values > threshold
+        selected_regressors = coef_df[coef_df['coef'].abs() > coefficient_threshold]['regressor'].tolist()
+        
+        print(f"  Selected {len(selected_regressors)} out of {len(regressor_cols)} features ({len(selected_regressors)/len(regressor_cols)*100:.1f}%)")
+        print("  Selected features:")
+        for i, reg in enumerate(selected_regressors):
+            coef_value = coef_df[coef_df['regressor'] == reg]['coef'].values[0]
+            print(f"    {i+1}. {reg} (coef: {coef_value:.4f})")
+        
+        # Retrain model with only selected features
+        print("\nRetraining Prophet model with selected features...")
+        final_model = Prophet(
+            yearly_seasonality=yearly_seasonality,
+            weekly_seasonality=weekly_seasonality,
+            daily_seasonality=daily_seasonality,
+            uncertainty_samples=10000
+        )
+        
+        # Add only the selected regressors
+        for col in selected_regressors:
+            final_model.add_regressor(col)
+        
+        # Refit with selected features
+        final_model.fit(train_df[['ds', 'y'] + selected_regressors])
+        
+        model = final_model
+        regressor_cols = selected_regressors
+        results['feature_selection_results'] = {
+            'initial_regressors': len(prophet_df.columns) - 2,  # -2 for ds and y
+            'selected_regressors': selected_regressors,
+            'coefficient_threshold': coefficient_threshold
+        }
+    else:
+        model = initial_model
+        
     results['model'] = model
+    results['regressor_cols'] = regressor_cols
     results['fig_regressor_coefficients'] = plot_regressor_coefficients(model, show=False) if regressor_cols else None
+
+
+
+
+
+
+
+
+
+
 
     # 7. Make Predictions
     results['forecast_test'] = model.predict(test_df)
@@ -2159,7 +2227,17 @@ if __name__ == "__main__":
         daily_seasonality=False, # Usually False for daily data unless strong intra-day pattern
         custom_date_dummies=CUSTOM_DATE_DUMMIES,
         perform_covariate_evaluation=True,
-        max_lag_for_evaluation=70
+        max_lag_for_evaluation=70,
+
+
+
+
+        feature_selection=True,           # Enable feature selection
+        coefficient_threshold=0.1         # Set the threshold for important features 
+
+
+
+
     )
 
 
