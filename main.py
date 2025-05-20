@@ -1631,6 +1631,7 @@ def export_artifacts(results, output_dir=DEFAULT_OUTPUT_DIR, log_transform=True)
 
 
         'fig_monthly_forecast': 'monthly_forecast',
+        'fig_holiday_analysis': 'holiday_coefficient_analysis',
 
 
 
@@ -1930,18 +1931,6 @@ def plot_monthly_actuals_and_forecast(
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
 # --- Main Pipeline Orchestrator ---
 
 def run_prophet_pipeline(
@@ -1967,7 +1956,6 @@ def run_prophet_pipeline(
 
 
 
-    feature_selection=False,
     coefficient_threshold=0.1
 
 
@@ -2039,70 +2027,73 @@ def run_prophet_pipeline(
 
 
 
-    # 6. Train Initial Model
-    print("Initializing Prophet model...")
-    initial_model = Prophet(
-        yearly_seasonality=yearly_seasonality,
-        weekly_seasonality=weekly_seasonality,
-        daily_seasonality=daily_seasonality,
-        uncertainty_samples=10000
-    )
+    # 6. Train Model
 
-    if regressor_cols:
-        print(f"  Adding {len(regressor_cols)} regressors to initial model...")
-        for col in regressor_cols:
-            initial_model.add_regressor(col)
-
-    print("Fitting initial Prophet model...")
-    initial_model.fit(train_df)
-    print("Initial model fitting complete.")
-    
-    # Feature Selection based on coefficient values if requested
-    if feature_selection and regressor_cols:
-        print(f"\n--- Performing Feature Selection (coefficient threshold: {coefficient_threshold}) ---")
-        # Get regressor coefficients
-        coef_df = regressor_coefficients(initial_model)
-        
-        # Select regressors with absolute coefficient values > threshold
-        selected_regressors = coef_df[coef_df['coef'].abs() > coefficient_threshold]['regressor'].tolist()
-        
-        print(f"  Selected {len(selected_regressors)} out of {len(regressor_cols)} features ({len(selected_regressors)/len(regressor_cols)*100:.1f}%)")
-        print("  Selected features:")
-        for i, reg in enumerate(selected_regressors):
-            coef_value = coef_df[coef_df['regressor'] == reg]['coef'].values[0]
-            print(f"    {i+1}. {reg} (coef: {coef_value:.4f})")
-        
-        # Retrain model with only selected features
-        print("\nRetraining Prophet model with selected features...")
-        final_model = Prophet(
+    def train_model(train_df=train_df, regressor_cols=regressor_cols, uncertainty_samples=10000):
+        print("Training Prophet model...")
+        model = Prophet(
             yearly_seasonality=yearly_seasonality,
             weekly_seasonality=weekly_seasonality,
             daily_seasonality=daily_seasonality,
-            uncertainty_samples=10000
+            uncertainty_samples=uncertainty_samples
         )
+        for col in regressor_cols:
+            model.add_regressor(col)
+        model.fit(train_df[['ds', 'y'] + regressor_cols])
+        coef_df = regressor_coefficients(model)
+        unselected_regressors = coef_df[coef_df['coef'].abs() <= coefficient_threshold]['regressor'].tolist()
+        return model, unselected_regressors
+    
+    if len(regressor_cols) >= 100:
+
+        print(f"  Unselecting regressors by groups (Events and Seasonalities) from {len(regressor_cols)} columns...")
+
+        # get the list of possible events and seasonalities and its columns
+        _, feature_events, _ = calendar_events_features(workingdays=True)
+        _, feature_seasonalities = calendar_seasonal_features()
+        groups = [event for event in feature_events] + [seas for seas in feature_seasonalities]
+
+        # get the list of possible groups columns
+        groups_cols = [col for col in regressor_cols if any(group in col for group in groups)]
+        # removing all columns that are groups from regressor_cols
+        main_regressor_cols = [col for col in regressor_cols if col not in groups_cols] 
         
-        # Add only the selected regressors
-        for col in selected_regressors:
-            final_model.add_regressor(col)
-        
-        # Refit with selected features
-        final_model.fit(train_df[['ds', 'y'] + selected_regressors])
-        
-        model = final_model
-        regressor_cols = selected_regressors
-        results['feature_selection_results'] = {
-            'initial_regressors': len(prophet_df.columns) - 2,  # -2 for ds and y
-            'selected_regressors': selected_regressors,
-            'coefficient_threshold': coefficient_threshold
-        }
-    else:
-        model = initial_model
-        
+        unselected_regressors = []
+        for group in groups:
+            # adding the group columns to regressor_cols
+            group_cols = [col for col in regressor_cols if group in col]
+            group_regressor_cols = main_regressor_cols + group_cols
+            _, unselected_cols = train_model(regressor_cols = group_regressor_cols, uncertainty_samples=1000)    
+            unselected_regressors += unselected_cols
+            print(f"  Unselected regressors for group '{group}': {len(unselected_cols)} / {len(group_cols)}\n\n")
+
+        # Remove unselected regressors from regressor_cols
+        regressor_cols = results['regressor_cols'] = [col for col in regressor_cols if col not in unselected_regressors]
+        print(f"  Remaining regressors: {len(regressor_cols)}")
+
+    if len(regressor_cols) >= 100:
+        print(f"  Unselecting regressors from {len(regressor_cols)} columns...")
+
+        _, unselected_regressors = train_model(regressor_cols = regressor_cols, uncertainty_samples=1000)    
+
+        # Remove unselected regressors from regressor_cols
+        regressor_cols = results['regressor_cols'] = [col for col in regressor_cols if col not in unselected_regressors]
+        print(f"  Remaining regressors: {len(regressor_cols)}")
+    
+    results['feature_selection_results'] = {
+        'initial_regressors': len(train_df.columns) - 2,  # -2 for ds and y
+        'selected_regressors': regressor_cols,
+        'coefficient_threshold': coefficient_threshold
+    }
+
+    print("Initializing Prophet model with selected regressors...")
+    model, _ = train_model(regressor_cols = regressor_cols)    
+    print("model fitting complete.")
+
     results['model'] = model
-    results['regressor_cols'] = regressor_cols
     results['fig_regressor_coefficients'] = plot_regressor_coefficients(model, show=False) if regressor_cols else None
 
-
+    
 
 
 
@@ -2232,7 +2223,6 @@ if __name__ == "__main__":
 
 
 
-        feature_selection=True,           # Enable feature selection
         coefficient_threshold=0.1         # Set the threshold for important features 
 
 
