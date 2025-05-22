@@ -1,10 +1,15 @@
 import os
 import warnings
+import pickle
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from matplotlib.gridspec import GridSpec
+from matplotlib.patches import Patch
 from datetime import datetime, timedelta, date
 from dateutil.easter import easter
+from scipy import stats
 from prophet import Prophet
 from prophet.utilities import regressor_coefficients
 from pandas.errors import PerformanceWarning
@@ -12,17 +17,20 @@ from pandas.errors import PerformanceWarning
 # --- Configuration ---
 warnings.filterwarnings('ignore', category=PerformanceWarning)
 
-# --- Constants ---
-DEFAULT_OUTPUT_DIR = 'exports'
-DEFAULT_PLOTS_DIR = os.path.join(DEFAULT_OUTPUT_DIR, 'plots')
-DEFAULT_FORECASTS_DIR = os.path.join(DEFAULT_OUTPUT_DIR, 'forecasts')
-DEFAULT_MODELS_DIR = os.path.join(DEFAULT_OUTPUT_DIR, 'models')
-
-TARGET_PATH = 'data/groupby_train.csv'
-COVARIATE_PATH = 'data/groupby_transactions_2.csv'
+# --- Especification Constants ---
 DEFAULT_DATE_COL = 'date'
 DEFAULT_TARGET_COL = 'sales'
 DEFAULT_COVARIATE_COLS = ['transactions']
+DEFAULT_CUSTOM_DATE_DUMMIES = [
+        {
+            'name': 'blackfriday_dummy',
+            'dates': [
+                '2014-11-28', '2015-11-27', '2016-11-25', '2017-11-24', 
+                '2018-11-23', '2019-11-29', '2020-11-27', '2021-11-26',
+                '2022-11-25', '2023-11-24'
+            ]
+        }
+    ]
 
 DEFAULT_LOG_TRANSFORM = True
 DEFAULT_DIFF_TRANSFORM = False
@@ -30,12 +38,26 @@ DEFAULT_COVARIATE_FORECASTING = True
 DEFAULT_COVARIATES_LAGS = [0, 1, 7, 30]
 DEFAULT_EVENT_LAGS = 1
 DEFAULT_EVENT_LEADS = 1
-DEFAULT_THRESHOLD_FEATURE_SELECTION = 0.05
+DEFAULT_THRESHOLD_FEATURE_SELECTION = 0.01
 
-TEST_SIZE = 30
-FORECAST_SIZE = 180
+TEST_SIZE = 180
+FORECAST_SIZE = 365 * 3
+
+# --- Directory Constants ---
+TARGET_PATH = os.path.join(os.getcwd(), 'data/groupby_train.csv')
+COVARIATE_PATH = os.path.join(os.getcwd(), 'data/groupby_transactions_2.csv')
+
 
 # --- Color Constants ---
+DEFAULT_COLOR_COMPONENT = 'tab:blue'
+DEFAULT_COLOR_STANDARD = 'slategrey'
+DEFAULT_COLOR_HIGHLIGHT = 'tab:orange'
+DEFAULT_COLOR_ACTUAL = 'slategrey'
+DEFAULT_COLOR_PREDICTED = 'tab:red'
+DEFAULT_COLOR_FORECAST = 'tab:orange'
+DEFAULT_COLOR_PASSED_TEST = 'tab:blue'
+DEFAULT_COLOR_FAILED_TEST = 'tab:red'
+
 TEXT_RED = '\033[91m'
 TEXT_GREEN = '\033[92m'
 TEXT_YELLOW = '\033[93m'
@@ -344,8 +366,8 @@ def feature_engeneering(df = None,
                         diff_transform: bool = DEFAULT_DIFF_TRANSFORM, 
                         covariate_forecasting: bool = DEFAULT_COVARIATE_FORECASTING, 
                         future_periods: int = FORECAST_SIZE,
-                        covariates_lags: list = DEFAULT_COVARIATES_LAGS, 
-                        custom_date_dummies: dict = None,
+                        covariates_lags: list[int] = DEFAULT_COVARIATES_LAGS, 
+                        custom_date_dummies: list[dict] = DEFAULT_CUSTOM_DATE_DUMMIES,
                         event_lags: int = DEFAULT_EVENT_LAGS,
                         event_leads: int = DEFAULT_EVENT_LEADS,
                         event_weekdays: bool = True,
@@ -423,10 +445,8 @@ def feature_engeneering(df = None,
     if 0 in covariates_lags:
         covariates = covariates.drop(columns=covariate_cols)
     
-    target_cols = [col for col in transformable_df.columns if target_col in col]
-    data = pd.concat([transformable_df[target_cols], covariates], axis=1)
-
-    results['target_cols'] = target_cols
+    results['target_col'] = target_col = [col for col in transformable_df.columns if target_col in col][0]
+    data = pd.concat([transformable_df[target_col], covariates], axis=1)
     results['covariate_cols'] = covariates.columns.to_list()
     
     # Merge non-transformable covariates back into the transformed DataFrame
@@ -469,12 +489,12 @@ def feature_engeneering(df = None,
     data = pd.concat([data, seasonal_features[mask]], axis=1)
 
     results['target_cutoff_dates'] = {
-        'start': data[target_cols].dropna().index[0].date(),
-        'end': data[target_cols].dropna().index[-1].date()
+        'start': data[target_col].dropna().index[0].date(),
+        'end': data[target_col].dropna().index[-1].date()
     }
     results['covariates_cutoff_dates'] = {
-        'start': data.drop(columns=target_cols).dropna().index[0].date(),
-        'end': data.drop(columns=target_cols).dropna().index[-1].date()
+        'start': data.drop(columns=target_col).dropna().index[0].date(),
+        'end': data.drop(columns=target_col).dropna().index[-1].date()
     }
     results['data'] = data.copy()
 
@@ -625,7 +645,7 @@ def feature_selection(split_data_results: dict,
             print(f"   Check regressors coefficients for event: {TEXT_BLUE}{event}{TEXT_COLOR_END}")
             under_threshold_regressors += check_regressor_under_threshold(
                 train_data=split_data_results['train'], 
-                target_col=feature_engeneering_results['target_cols'][0], 
+                target_col=feature_engeneering_results['target_col'], 
                 covariate_cols=main_regression_cols + seas_cols,
                 checking_cols=event_cols,
                 threshold=threshold
@@ -636,7 +656,7 @@ def feature_selection(split_data_results: dict,
             print(f"   Check regressors coefficients for seas: {TEXT_ORANGE}{seas}{TEXT_COLOR_END}")
             under_threshold_regressors += check_regressor_under_threshold(
                 train_data=split_data_results['train'], 
-                target_col=feature_engeneering_results['target_cols'][0], 
+                target_col=feature_engeneering_results['target_col'], 
                 covariate_cols=main_regression_cols + checked_events_cols,
                 checking_cols=seas_cols,
                 threshold=threshold
@@ -652,7 +672,7 @@ def feature_selection(split_data_results: dict,
     under_threshold_regressors += check_regressor_under_threshold(
         train_data=split_data_results['train'], 
         covariate_cols=None,
-        target_col=feature_engeneering_results['target_cols'][0], 
+        target_col=feature_engeneering_results['target_col'], 
         checking_cols=regression_cols,
         threshold=threshold
     )
@@ -661,24 +681,30 @@ def feature_selection(split_data_results: dict,
 
 
 
-def reverse_transformations(model_results: dict, 
+def reverse_transformations(target_col: str,
+                            loaded_data: pd.DataFrame,
+                            model_results: dict, 
                             log_transform: bool = DEFAULT_LOG_TRANSFORM,
-                            diff_transform: bool = DEFAULT_DIFF_TRANSFORM,
-                            target_col: str = DEFAULT_TARGET_COL
+                            diff_transform: bool = DEFAULT_DIFF_TRANSFORM
                             ) -> dict:
     
     # Reverse log transformation
     results: dict = {}
-    cols: list = [target_col, 'yhat', 'yhat_lower', 'yhat_upper', 'trend', 'trend_lower', 'trend_upper'] 
+    cols: list = ['yhat', 'yhat_lower', 'yhat_upper', 'trend', 'trend_lower', 'trend_upper'] 
     for df in model_results['predictions']:
-        results[df] = pd.DataFrame(index=model_results['predictions'][df].index)
+        results[df] = pd.DataFrame(index=model_results['predictions'][df].index)\
+            .merge(
+                loaded_data[target_col.replace('diff_','').replace('log_','')], 
+                how='left', 
+                left_index=True, 
+                right_index=True
+            )
         for col in cols:
             if col in model_results['predictions'][df].columns:
                 if diff_transform:
                     results[df][col] = model_results['predictions'][df][col].cumsum()
                     if log_transform:
                         results[df][col] = np.expm1(results[df][col])
-                
                 elif log_transform:
                     results[df][col] = np.expm1(model_results['predictions'][df][col])
     return results
@@ -844,9 +870,390 @@ def evaluation_metrics(split_data_results: pd.DataFrame,
                 print(text)
             else:
                 print(f"      {metric}: {TEXT_YELLOW}{val:.2f}{TEXT_COLOR_END}")
+    print(f"\n")  
 
     return results
+
+
+
+def plot_fitted_model(target_col: str,
+                      model_results: dict,
+                      split_data_results: dict,
+                      evaluation_results: dict,
+                      ) -> dict:       
+
+    # data
+    fitted = model_results['predictions']['train']['yhat'].values
+    actuals = split_data_results['train'][target_col].fillna(model_results['predictions']['train']['yhat']).values
+    trend = model_results['predictions']['train']['trend'].values
+    matched_dates = split_data_results['train'].index
+    monthly_df = pd.DataFrame({'actual': actuals, 'fitted': fitted, 'trend': trend},index=matched_dates).resample('ME').mean()
+    seasonal_df = pd.DataFrame({'date': matched_dates, 'fitted': fitted})
+    seasonal_df['day_of_week'] = seasonal_df['date'].dt.dayofweek
+    seasonal_df['month'] = seasonal_df['date'].dt.month
+    mean_fitted = 1.0 if np.mean(fitted) == 0 else np.mean(fitted) # Avoid division by zero
+
+    dow_grouped = seasonal_df.groupby('day_of_week')['fitted'].agg(['mean', 'std']).reindex(range(7)) # Ensure all days are present
+    dow_grouped['normalized_mean'] = dow_grouped['mean'] / mean_fitted
+    dow_grouped['normalized_std'] = dow_grouped['std'] / mean_fitted
+    upper_bound_dow = dow_grouped['normalized_mean'] + dow_grouped['normalized_std']
+    lower_bound_dow = dow_grouped['normalized_mean'] - dow_grouped['normalized_std']
+    day_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+    x_dow = np.arange(len(day_names))
+
+    month_grouped = seasonal_df.groupby('month')['fitted'].agg(['mean', 'std']).reindex(range(1, 13)) # Ensure all months
+    month_grouped['normalized_mean'] = month_grouped['mean'] / mean_fitted
+    month_grouped['normalized_std'] = month_grouped['std'] / mean_fitted
+    upper_bound_month = month_grouped['normalized_mean'] + month_grouped['normalized_std']
+    lower_bound_month = month_grouped['normalized_mean'] - month_grouped['normalized_std']
+    month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+    x_month = np.arange(len(month_names))
+
+    # Metrics
+    min_val = min(np.min(actuals), np.min(fitted)) * 0.98
+    max_val = max(np.max(actuals), np.max(fitted)) * 1.02
+    residuals = actuals - fitted
+    mean = np.mean(residuals)
+    std = np.std(residuals)
+    overfitting = evaluation_results['daily']['overfitting ~0']
+    r_squared = evaluation_results['daily']['r-squared ~1']
+    mape = evaluation_results['daily']['mape']['train']
+    aicc = evaluation_results['daily']['aicc']
+    skew = evaluation_results['daily']['skewness ~0']
+    kurtosis = evaluation_results['daily']['kurtosis ~3']
+    homos = evaluation_results['daily']['homocedasticity ~0']
+    dw = evaluation_results['daily']['durbin-watson ~2']
+    monthly_mape = evaluation_results['monthly']['mape']['train']
+
+    # Diagnostics
+    x_norm = np.linspace(min(residuals), max(residuals), 100)
+    y_norm = stats.norm.pdf(x_norm, mean, std)
+    mean_acceptable = abs(mean) < np.mean(np.abs(actuals)) * 0.01
+    is_normal = (abs(skew) < 0.5) and (2.5 < abs(kurtosis) < 3.5)
+    is_homoscedastic = abs(homos) < 0.3
+    no_autocorrel = 1.5 < dw < 2.5
+    outlier_threshold = 3 * std
+    outlier_mask = np.abs(residuals) > outlier_threshold
+    outlier_count = np.sum(outlier_mask)
+    no_outliers = outlier_count < len(residuals) * 0.03
+    diagnostics_text = (
+        f"RESIDUAL DIAGNOSTICS:\n"
+        f"Zero mean? {'✓' if mean_acceptable else '✗'}\n"
+        f"Normal distr.? {'✓' if is_normal else '✗'} (sk={skew:.2f}, ku={kurtosis:.2f})\n"
+        f"Homoscedastic? {'✓' if is_homoscedastic else '✗'} (corr={homos:.2f})\n"
+        f"No autocorrel.? {'✓' if no_autocorrel else '✗'} (DW={dw:.2f})\n"
+        f"No outliers? {'✓' if no_outliers else '✗'} ({outlier_count} pts)"
+    )
+
+    # Create a 2x5 grid of subplots
+    fig = plt.figure(figsize=(24, 12)) 
+    gs = GridSpec(2, 5, height_ratios=[1, 1.5], figure=fig) 
+    ax1 = fig.add_subplot(gs[0, 0])  # Scatter plot (top-left)
+    ax4 = fig.add_subplot(gs[0, 1])  # Residuals histogram (top-middle-left)
+    ax3 = fig.add_subplot(gs[0, 2])  # Monthly plot (top-middle-right)
+    ax5 = fig.add_subplot(gs[0, 3])  # Weekly seasonality (top-right-1)
+    ax6 = fig.add_subplot(gs[0, 4])  # Monthly seasonality (top-right-2)
+    ax2 = fig.add_subplot(gs[1, :])  # Daily plot (full bottom row)    
+
+    # --- SUBPLOT 1: Scatter plot ---
+    ax1.scatter(actuals, fitted, s=8, alpha=0.5, color=DEFAULT_COLOR_STANDARD)
+    ax1.plot([min_val, max_val], [min_val, max_val], color=DEFAULT_COLOR_HIGHLIGHT, linewidth=2.5 , alpha=0.8, label='Perfect Fit')
+    ax1.plot([min_val, max_val], [min_val + outlier_threshold, max_val + outlier_threshold],
+            color=DEFAULT_COLOR_HIGHLIGHT, linestyle='dashed', alpha=0.5, linewidth=0.7, label=f'±{outlier_threshold:.1f} Threshold') # Updated label
+    ax1.plot([min_val, max_val], [min_val - outlier_threshold, max_val - outlier_threshold],
+            color=DEFAULT_COLOR_HIGHLIGHT, linestyle='dashed', alpha=0.5, linewidth=0.7)  
+    if outlier_mask.any():
+        ax1.scatter(actuals[outlier_mask], fitted[outlier_mask],
+                    s=16, color=DEFAULT_COLOR_HIGHLIGHT, alpha=1.0, 
+                    marker='o', label=f'Outliers ({sum(outlier_mask)})')
+    stats_text = f"R²: {r_squared:.2f}\nMAPE: {mape:.2f}%\nAICc: {aicc:,.0f}"
+    ax1.text(0.05, 0.95, stats_text,
+            transform=ax1.transAxes, fontsize=8, verticalalignment='top',
+            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    ax1.set_xlabel('Actual Values')
+    ax1.set_ylabel('Fitted Values')
+    ax1.set_title("Actual vs. Fitted (Train)")
+    ax1.grid(True, alpha=0.3)
+    ax1.legend(fontsize=8, loc='lower right')
+    ax1.set_xlim(min_val, max_val)
+    ax1.set_ylim(min_val, max_val)
+
+    # --- SUBPLOT 4: Residuals histogram ---
+    n_bins = min(50, max(10, int(len(residuals) / 10)))
+    ax4.hist(residuals, bins=n_bins, alpha=0.6, color=DEFAULT_COLOR_STANDARD, edgecolor='black', density=True) # Use density=True
+    ax4.plot(x_norm, y_norm, color=DEFAULT_COLOR_HIGHLIGHT, alpha=0.8, linewidth=2.5, label='Normal Dist.')
+    ax4.text(0.02, 0.97, diagnostics_text,
+            transform=ax4.transAxes, fontsize=8, verticalalignment='top', # Smaller font
+            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    ax4.set_xlabel('Residual (Actual - Fitted)')
+    ax4.set_ylabel('Density')
+    ax4.set_title('Residuals Distribution')
+    ax4.grid(True, alpha=0.3, axis='y')
+    ax4.axvline(x=0, color=DEFAULT_COLOR_HIGHLIGHT, linestyle='--', alpha=0.7)
+    ax4.legend(fontsize=8)
+
+    # --- SUBPLOT 3: Monthly aggregation ---
+    ax3.plot(monthly_df.index, monthly_df['actual'], color=DEFAULT_COLOR_ACTUAL, linewidth=2, alpha=1.0, label='Actual (Avg)')
+    ax3.plot(monthly_df.index, monthly_df['fitted'], color=DEFAULT_COLOR_PREDICTED, linewidth=2, alpha=0.7, label='Fitted (Avg)')
+    ax3.plot(monthly_df.index, monthly_df['trend'], color=DEFAULT_COLOR_COMPONENT, linewidth=3, alpha=1.0, linestyle='-', label='Trend (Avg)')
+    monthly_stats = f"Monthly MAPE: {monthly_mape:.2f}%"
+    ax3.text(0.05, 0.95, monthly_stats,
+            transform=ax3.transAxes, fontsize=8, verticalalignment='top',
+            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    ax3.set_xlabel('Date')
+    ax3.set_ylabel('Monthly Average Value')
+    ax3.set_title("Monthly Aggregation (Train)")
+    ax3.grid(True, alpha=0.3)
+    ax3.legend(fontsize=8)
+    ax3.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m')) # Format date axis
+    ax3.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=3, maxticks=7)) # Auto ticks
+
+    # --- SUBPLOT 5: Weekly seasonality ---
+    ax5.plot(x_dow, dow_grouped['normalized_mean'], 'o-', color=DEFAULT_COLOR_COMPONENT, linewidth=3, markersize=8, label='Actual (% of avg)')
+    ax5.fill_between(x_dow, lower_bound_dow.fillna(dow_grouped['normalized_mean']), upper_bound_dow.fillna(dow_grouped['normalized_mean']), color=DEFAULT_COLOR_COMPONENT, alpha=0.2, label='±1σ per day') # Handle NaNs in std
+    ax5.axhline(y=1.0, color=DEFAULT_COLOR_STANDARD, linestyle='--', alpha=0.7, label='Overall Average')
+    ax5.set_xticks(x_dow)
+    ax5.set_xticklabels(day_names, rotation=45)
+    ax5.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{x:.1f}'))
+    ax5.set_xlabel('Day of Week')
+    ax5.set_ylabel('Relative to Average')
+    ax5.set_title('Weekly Pattern (Actuals)')
+    ax5.grid(True, alpha=0.3, axis='y')
+    ax5.legend(fontsize=8)
+    ax5.set_ylim(bottom=max(0, lower_bound_dow.min() * 0.9 if not lower_bound_dow.isnull().all() else 0)) # Adjust y-lim
+
+    # --- SUBPLOT 6: Monthly seasonality ---
+    ax6.plot(x_month, month_grouped['normalized_mean'], 'o-', color=DEFAULT_COLOR_COMPONENT, linewidth=3, markersize=8, label='Actual (% of avg)')
+    ax6.fill_between(x_month, lower_bound_month.fillna(month_grouped['normalized_mean']), upper_bound_month.fillna(month_grouped['normalized_mean']), color=DEFAULT_COLOR_COMPONENT, alpha=0.2, label='±1σ per month') # Handle NaNs
+    ax6.axhline(y=1.0, color=DEFAULT_COLOR_STANDARD, linestyle='--', alpha=0.7, label='Overall Average')
+    ax6.set_xticks(x_month)
+    ax6.set_xticklabels(month_names, rotation=45)
+    ax6.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{x:.1f}'))
+    ax6.set_xlabel('Month')
+    ax6.set_ylabel('Relative to Average')
+    ax6.set_title('Monthly Pattern (Actuals)')
+    ax6.grid(True, alpha=0.3, axis='y')
+    ax6.legend(fontsize=8)
+    ax6.set_ylim(bottom=max(0, lower_bound_month.min() * 0.9 if not lower_bound_month.isnull().all() else 0)) # Adjust y-lim
+
+    # --- SUBPLOT 2: Daily time series ---
+    ax2.plot(matched_dates, actuals, color=DEFAULT_COLOR_ACTUAL, alpha=1.0, label='Actual Values', linewidth=1.0)
+    ax2.plot(matched_dates, fitted, color=DEFAULT_COLOR_PREDICTED, alpha=0.7, label='Fitted Values', linewidth=1.5)
+    ax2.plot(matched_dates, trend, color=DEFAULT_COLOR_COMPONENT, linewidth=2, alpha=0.7, linestyle='--', label='Trend')
+    if outlier_mask.any():
+        outlier_dates = matched_dates[outlier_mask]
+        outlier_actuals = actuals[outlier_mask]
+        ax2.scatter(outlier_dates, outlier_actuals, s=200, color=DEFAULT_COLOR_HIGHLIGHT, alpha=1.0,
+                    marker='o', edgecolors='white', linewidths=1.0,
+                    label=f'Outliers ({sum(outlier_mask)})')
+        # Add annotations (optional, can be slow for many outliers)
+        for date, value in zip(outlier_dates, outlier_actuals):
+            date_str = date.strftime('%Y-%m-%d')
+            y_pos = value * 1.04
+            ax2.annotate(date_str, (date, y_pos), textcoords="offset points", xytext=(0, 5),
+                         ha='center', fontsize=12, rotation=45,
+                         bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="orange", alpha=0.7))
+    ax2.set_xlabel('Date')
+    ax2.set_ylabel('Value')
+    ax2.set_title("Daily Actual vs. Fitted (Train)")
+    ax2.grid(True, alpha=0.3)
+    ax2.legend(fontsize=8)
+
+    plt.setp(ax2.get_xticklabels(), rotation=30, ha='right') # Rotate labels for ax2
+    plt.tight_layout(rect=[0, 0.03, 1, 0.97]) # Adjust layout to prevent title/label overlap
+
+    return fig
+
+
+
+def plot_forecast(target_col: str,
+                  evaluation_results: dict,
+                  reverse_transform_results: dict
+                  ) -> dict:   
+    
+    # data
+    target_col = target_col.replace('diff_','').replace('log_','')
+    daily_train_date = reverse_transform_results['train'].tail(60).index
+    daily_train_actual = reverse_transform_results['train'][target_col].tail(60).values
+    daily_test_date = reverse_transform_results['test'].index
+    daily_test_actual = reverse_transform_results['test'][target_col].values
+    daily_test_pred = reverse_transform_results['test']['yhat'].values
+    daily_forecast_date = reverse_transform_results['forecast'].index
+    daily_forecast_pred = reverse_transform_results['forecast']['yhat'].values
+    daily_forecast_pred_lower = reverse_transform_results['forecast']['yhat_lower'].values
+    daily_forecast_pred_upper = reverse_transform_results['forecast']['yhat_upper'].values
+
+    train_date_cutoff = pd.to_datetime(reverse_transform_results['train'].index[-1]).to_period('M').start_time
+    test_date_cutoff_end = pd.to_datetime(reverse_transform_results['test'].index[-1]).to_period('M').end_time
+    test_date_cutoff_start = pd.to_datetime(reverse_transform_results['test'].index[-1]).to_period('M').start_time
+    forecast_date_cutoff = pd.to_datetime(reverse_transform_results['forecast'].index[-1]).to_period('M').start_time - timedelta(days=1)
+
+    daily_data = pd.concat([reverse_transform_results['train'], reverse_transform_results['test'], reverse_transform_results['forecast']])
+    daily_data['combined'] = np.where(
+        daily_data.index <= train_date_cutoff,
+        daily_data[target_col],
+        daily_data['yhat']
+    )
+    monthly_data = daily_data.resample('ME').sum()
+    yearly_data = daily_data.resample('YE').sum()
+    # remove last year if it is not full
+    yearly_data = yearly_data[yearly_data.index.year < pd.to_datetime(reverse_transform_results['forecast'].index[-1]).year]
+
+    monthly_train_date = monthly_data.index[monthly_data.index <= train_date_cutoff]
+    monthly_train_actual = monthly_data.loc[monthly_train_date, target_col].values
+    monthly_train_test_date = monthly_data.index[monthly_data.index <= test_date_cutoff_end]
+    monthly_train_test_actual = monthly_data.loc[monthly_train_test_date, target_col].values
+    monthly_test_date = monthly_data.index[(monthly_data.index >= train_date_cutoff) & (monthly_data.index <= test_date_cutoff_end)]
+    monthly_test_actual = monthly_data.loc[monthly_test_date, target_col].values
+    monthly_test_pred = monthly_data.loc[monthly_test_date, 'yhat'].values
+    monthly_forecast_date = monthly_data.index[(monthly_data.index >= test_date_cutoff_start) & (monthly_data.index <= forecast_date_cutoff)]
+    monthly_forecast_pred = monthly_data.loc[monthly_forecast_date, 'yhat'].values
+
+    annual_colors = []
+    for year in yearly_data.index.year:
+        if year < train_date_cutoff.year:
+            annual_colors.append(DEFAULT_COLOR_ACTUAL)
+        elif year > test_date_cutoff_end.year:
+            annual_colors.append(DEFAULT_COLOR_FORECAST)
+        else:
+            annual_colors.append(DEFAULT_COLOR_PREDICTED)
+
+
+    # Create a 2x5 grid of subplots
+    fig = plt.figure(figsize=(24, 12)) 
+    gs = GridSpec(2, 2, height_ratios=[1, 1.5], figure=fig) 
+    ax3 = fig.add_subplot(gs[0, 0])  # Monthly (top-left)
+    ax2 = fig.add_subplot(gs[0, 1])  # Yearly (top-right)
+    ax1 = fig.add_subplot(gs[1, :])  # Daily (full bottom row)  
+
+    # --- SUBPLOT 1: Daily ---
+    ax1.plot(daily_train_date, daily_train_actual, color=DEFAULT_COLOR_ACTUAL, lw=0.7, label='Trainning Actuals')
+    ax1.plot(daily_test_date, daily_test_actual, color=DEFAULT_COLOR_ACTUAL, lw=2, label='Test Actuals')
+    ax1.plot(daily_test_date, daily_test_pred, color=DEFAULT_COLOR_PREDICTED, lw=2, alpha=0.7, label='Test Prediction')
+    ax1.plot(daily_forecast_date, daily_forecast_pred, color=DEFAULT_COLOR_FORECAST, lw=2, label='Forecast')
+    if len(daily_forecast_date) < 180:
+        ax1.fill_between(daily_forecast_date, daily_forecast_pred_lower, daily_forecast_pred_upper, color=DEFAULT_COLOR_FORECAST, alpha=0.15)
+    ax1.axvline(daily_test_date[0], color=DEFAULT_COLOR_PREDICTED, linestyle=':', lw=1, label='Train/Test Split')
+    ax1.axvline(daily_forecast_date[0], color=DEFAULT_COLOR_FORECAST, linestyle=':', lw=1, label='Forecast Start')
+    ax1.set_ylabel('Value')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+
+    # --- SUBPLOT 2: Monthly ---
+    ax2.plot(monthly_train_test_date, monthly_train_test_actual, label='Trainning Actuals', color=DEFAULT_COLOR_ACTUAL, linestyle='-', linewidth=1.0)
+    ax2.plot(monthly_test_date, monthly_test_actual, label='Test Actuals', color=DEFAULT_COLOR_ACTUAL, linestyle='-', linewidth=2.5)
+    ax2.plot(monthly_test_date, monthly_test_pred, label='Test Prediction', color=DEFAULT_COLOR_PREDICTED, linestyle='-', linewidth=2.5 , alpha=0.7)
+    ax2.plot(monthly_forecast_date, monthly_forecast_pred, label='Forecast', color=DEFAULT_COLOR_FORECAST, linestyle='-', linewidth=2.5)
+    ax2.axvline(monthly_test_date[0], color=DEFAULT_COLOR_PREDICTED, linestyle=':', linewidth=1.0, alpha=0.5, label='Train/Test Split')
+    ax2.axvline(monthly_forecast_date[0], color=DEFAULT_COLOR_FORECAST, linestyle=':', linewidth=1.0, alpha=0.5, label='Forecast Start')
+    ax2.set_ylabel('Value (Monthly Sum)')
+    ax2.set_title('Monthly Aggregation')
+    ax2.legend(loc='upper left')
+    ax2.grid(True, alpha=0.3)
+
+    # --- SUBPLOT 2: Yearly ---
+    bars = ax3.bar(yearly_data.index.year, yearly_data['combined'].values, color=annual_colors, alpha=0.9)
+    ax3.set_ylabel('Annual Total')
+    ax3.set_title('Annual Aggregation')
+    ax3.grid(True, alpha=0.3) #, axis='y'
+    ax3.legend(handles=[
+            Patch(facecolor=DEFAULT_COLOR_ACTUAL, label='Actual Only'),
+            Patch(facecolor=DEFAULT_COLOR_FORECAST, label='Forecast Only'),
+            Patch(facecolor=DEFAULT_COLOR_PREDICTED, label='Actual + Forecast')
+        ], loc='upper left') 
+    
+    # Add value labels on top of each bar with YoY variation
+    for i, (bar, value) in enumerate(zip(bars, yearly_data['combined'].values)):
+        height = bar.get_height()
         
+        # Calculate year-over-year variation
+        yoy_text = ""
+        if i > 0:  # Skip for the first year as there's no previous year to compare
+            prev_value = yearly_data['combined'].values[i-1]
+            if prev_value > 0:  # Avoid division by zero
+                yoy_pct = ((value - prev_value) / prev_value) * 100
+                sign = "+" if yoy_pct >= 0 else ""
+                yoy_text = f"\n{sign}{yoy_pct:.1f}%"
+        
+        # Display value in milions and YoY variation
+        ax3.text(bar.get_x() + bar.get_width()/2., height + (max(yearly_data['combined'].values) * 0.02),
+                f'{int(value/1_000_000):,}M{yoy_text}', ha='center', va='bottom', rotation=0, fontsize=16)
+    ax3.set_ylim(0, max(yearly_data['combined'].values) * 1.25)
+
+    plt.tight_layout()
+
+    return fig
+
+
+
+def export_output(target_col: str,
+                  feature_engeneering_results: dict,
+                  split_data_results: dict, 
+                  model_results: dict, 
+                  model_evaluation_results: dict,
+                  reverse_transform_results: dict,
+                  output_path: str|None,
+                  export_models: bool = False,
+                  export_dataframes: bool = False,
+                  export_plots: bool = False,
+                  ) -> None:
+
+    output_path = os.path.join(os.getcwd(), 'output') if output_path is None else output_path
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    if export_models and model_results and 'model' in model_results:
+        models_path = os.path.join(output_path, target_col, 'models')
+        os.makedirs(models_path, exist_ok=True)
+        with open(os.path.join(models_path, f"model_{timestamp}.pkl"), 'wb') as f:
+            pickle.dump(model_results['model'], f)
+        print(f"   Model saved to {TEXT_BLUE}{os.path.join(models_path, f'model_{timestamp}.pkl')}{TEXT_COLOR_END}")
+
+    if export_dataframes:
+        dataframes_path = os.path.join(output_path, target_col, 'dataframes')
+        os.makedirs(dataframes_path, exist_ok=True)
+        if feature_engeneering_results and 'data' in feature_engeneering_results:
+            feature_engeneering_results['data'].to_csv(os.path.join(dataframes_path, f'feature_engeneering_data_{timestamp}.csv'))
+        print(f"   Feature engeneering data saved to {TEXT_BLUE}{os.path.join(dataframes_path, f'feature_engeneering_data_{timestamp}.csv')}{TEXT_COLOR_END}")
+
+        if split_data_results and export_dataframes:
+            for key, df in split_data_results.items():
+                df.to_csv(os.path.join(dataframes_path, f"split_data_{key}_{timestamp}.csv"))
+        print(f"   Split data saved to {TEXT_BLUE}{os.path.join(dataframes_path, f'split_data_{key}_{timestamp}.csv')}{TEXT_COLOR_END}")
+
+        if model_results and 'coefficients' in model_results:
+            model_results['coefficients'].to_csv(os.path.join(dataframes_path, f"model_coefficients_{timestamp}.csv"))
+        print(f"   Model coefficients saved to {TEXT_BLUE}{os.path.join(dataframes_path, f'model_coefficients_{timestamp}.csv')}{TEXT_COLOR_END}")
+
+        if model_results and 'predictions' in model_results:
+            for key, df in model_results['predictions'].items():
+                df['yhat'].to_csv(os.path.join(dataframes_path, f"predictions_{key}_{timestamp}.csv"))
+        print(f"   Predictions saved to {TEXT_BLUE}{os.path.join(dataframes_path, f'predictions_{key}_{timestamp}.csv')}{TEXT_COLOR_END}")
+
+        if reverse_transform_results:
+            for key, df in reverse_transform_results.items():
+                df.to_csv(os.path.join(dataframes_path, f"forecast_{key}_{timestamp}.csv"))
+        print(f"   Forecast data saved to {TEXT_BLUE}{os.path.join(dataframes_path, f'forecast_{key}_{timestamp}.csv')}{TEXT_COLOR_END}")
+
+    if export_plots:
+        plots_path = os.path.join(output_path, target_col, 'plots')
+        os.makedirs(plots_path, exist_ok=True)
+
+        plot_fitted_model(
+            target_col=target_col,
+            model_results=model_results,
+            split_data_results=split_data_results,
+            evaluation_results=model_evaluation_results
+        ).savefig(os.path.join(plots_path, f"fitted_model_{timestamp}.png"), dpi=300)
+        print(f"   Fitted model plot saved to {TEXT_BLUE}{os.path.join(plots_path, f'fitted_model_{timestamp}.png')}{TEXT_COLOR_END}")
+
+        plot_forecast(
+            target_col=target_col,
+            evaluation_results=model_evaluation_results,
+            reverse_transform_results=reverse_transform_results
+        ).savefig(os.path.join(plots_path, f"forecast_{timestamp}.png"), dpi=300)
+        print(f"   Forecast plot saved to {TEXT_BLUE}{os.path.join(plots_path, f'forecast_{timestamp}.png')}{TEXT_COLOR_END}")
+
+    
 
 
 
@@ -866,7 +1273,7 @@ if __name__ == "__main__":
         covariate_forecasting = DEFAULT_COVARIATE_FORECASTING, 
         future_periods = FORECAST_SIZE,
         covariates_lags = DEFAULT_COVARIATES_LAGS, 
-        custom_date_dummies = None,
+        custom_date_dummies = DEFAULT_CUSTOM_DATE_DUMMIES,
         event_lags = DEFAULT_EVENT_LAGS,
         event_leads = DEFAULT_EVENT_LEADS,
         event_weekdays = False,
@@ -894,26 +1301,40 @@ if __name__ == "__main__":
         train_data=split_data_results['train'], 
         test_data=split_data_results['test'],
         forecast_data=split_data_results['forecast'],
-        target_col=feature_engeneering_results['target_cols'][0],
+        target_col=feature_engeneering_results['target_col'],
         covariate_cols=regressor_cols
-    )
-
-    # reverse transformations
-    reverse_transform_results: dict = reverse_transformations(
-        model_results=model_results,
-        log_transform=DEFAULT_LOG_TRANSFORM,
-        diff_transform=DEFAULT_DIFF_TRANSFORM,
-        target_col=feature_engeneering_results['target_cols'][0]
     )
 
     # Model evaluation
     model_evaluation_results: dict = evaluation_metrics(
         split_data_results=split_data_results,
         prediction_results=model_results['predictions'],
-        target_col=feature_engeneering_results['target_cols'][0],
+        target_col=feature_engeneering_results['target_col'],
         n_params=len(regressor_cols) - 1
     )
-        
 
+    # reverse transformations
+    reverse_transform_results: dict = reverse_transformations(
+        target_col=feature_engeneering_results['target_col'],
+        loaded_data=loaded_data,
+        model_results=model_results,
+        log_transform=DEFAULT_LOG_TRANSFORM,
+        diff_transform=DEFAULT_DIFF_TRANSFORM
+    )
+ 
+    # Export output
+    export_output(
+        target_col=feature_engeneering_results['target_col'],
+        feature_engeneering_results=feature_engeneering_results,
+        split_data_results=split_data_results,
+        model_results=model_results,
+        model_evaluation_results=model_evaluation_results,
+        reverse_transform_results=reverse_transform_results,
+        output_path=None,
+        export_models=True,
+        export_dataframes=False,
+        export_plots=True
+    )
+    
 
     
